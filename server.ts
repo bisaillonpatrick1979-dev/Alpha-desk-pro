@@ -1,19 +1,29 @@
 import express from 'express';
 import path from 'path';
-import { router, hasGeminiKey, geminiModel } from './server/api';
+import { dispatch, hasGeminiKey, geminiModel } from './server/handlers';
 
 /**
  * Serveur local : sert l'API *et* l'application web.
  *
- * En production Vercel ce fichier n'est pas utilisé — c'est `api/index.ts` qui
- * expose les mêmes routes sous forme de fonction serverless, et Vercel sert le
- * dossier `dist` en statique.
+ * Sur Vercel ce fichier n'est pas exécuté — c'est `api/[[...path]].ts` qui
+ * expose les mêmes gestionnaires, et la plateforme sert `dist` en statique.
+ * Les deux hôtes partagent `server/handlers.ts`, ce qui garantit un
+ * comportement identique en local et en production.
  */
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '256kb' }));
-app.use(router);
+
+app.all('/api/*', async (req, res) => {
+  try {
+    const result = await dispatch(req.method, req.path, req.body);
+    res.status(result.status).json(result.body);
+  } catch (err) {
+    console.error('[api] erreur non rattrapée :', err);
+    res.status(500).json({ error: 'Erreur interne du serveur.' });
+  }
+});
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {

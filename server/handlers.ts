@@ -1,35 +1,51 @@
-import express, { Router } from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
 /**
- * Routes de l'API, isolées de la façon dont on les sert.
+ * Logique de l'API, sans dépendance à un framework web.
  *
- * Le même routeur alimente deux cibles : le serveur Express local (`server.ts`)
- * et la fonction serverless Vercel (`api/index.ts`). Auparavant les routes
- * étaient déclarées directement dans `server.ts`, un fichier que Vercel
- * n'exécute jamais — l'API répondait donc 404 en production.
+ * Chaque route est une fonction pure `(corps) -> { status, body }`. Deux hôtes
+ * la consomment : le serveur Express local (`server.ts`) et la fonction
+ * serverless Vercel (`api/[[...path]].ts`).
+ *
+ * Passer par une application Express montée comme handler serverless ajoutait
+ * un adaptateur inutile — et une source de panne au chargement du module en
+ * production. Des fonctions ordinaires suppriment ce risque et restent
+ * testables directement.
  */
-export const router: Router = express.Router();
+
+export interface ApiResponse {
+  status: number;
+  body: unknown;
+}
 
 // Le modèle est configurable : un identifiant invalide ne doit pas nécessiter
 // un redéploiement du code.
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-// Client Gemini initialisé côté serveur (la clé ne quitte jamais le backend).
+// Client Gemini créé à la première utilisation, jamais au chargement du module.
+// En serverless, une exception pendant l'initialisation fait échouer l'invocation
+// entière (FUNCTION_INVOCATION_FAILED) avant même d'atteindre le code de repli.
 const apiKey = process.env.GEMINI_API_KEY;
 let aiClient: GoogleGenAI | null = null;
-if (apiKey) {
-  aiClient = new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
+let aiClientReady = false;
+
+function getAiClient(): GoogleGenAI | null {
+  if (aiClientReady) return aiClient;
+  aiClientReady = true;
+  if (!apiKey) return null;
+  try {
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+    });
+  } catch (err) {
+    console.error('[gemini] initialisation impossible, repli sur le moteur de règles :', err);
+    aiClient = null;
+  }
+  return aiClient;
 }
 
 const mtTimestamp = (date = new Date()) => {
@@ -48,26 +64,10 @@ const mtTimestamp = (date = new Date()) => {
   return `${day} - ${time} MT`;
 };
 
+/** Garde-fou numérique : rejette NaN et Infinity, que `typeof` laisse passer. */
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
 
-router.get('/api/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    hasGeminiKey: !!apiKey,
-    model: apiKey ? GEMINI_MODEL : null,
-    engine: apiKey ? 'gemini' : 'rule-engine',
-  });
-});
-
-/**
- * Moteur de repli déterministe.
- *
- * Il sert dans deux cas : absence de clé API, mais aussi *échec* d'un appel
- * Gemini (quota, modèle inconnu, réseau). Auparavant seul le premier cas était
- * couvert et toute erreur d'API renvoyait un 500 : l'interface restait bloquée
- * sur « Délibération… » sans jamais produire de décision.
- */
 function runRuleEngine(asset: any, portfolio: any) {
   const { symbol, priceCAD, rsi, macd, ma50, ma200, support, resistance } = asset;
   const { activeBudgetCAD, maxRiskPercentPerTrade } = portfolio;
@@ -359,22 +359,38 @@ const responseSchema = {
   required: ['technicalAnalysis', 'sentimentAnalysis', 'riskManagement', 'finalDecision', 'webhookPayload'],
 };
 
-router.post('/api/agents/analyze', async (req, res) => {
-  const { asset, portfolio, userNotes } = req.body ?? {};
+/* ------------------------------------------------------------------ */
+/*  Gestionnaires de routes                                            */
+/* ------------------------------------------------------------------ */
+
+export function handleHealth(): ApiResponse {
+  return {
+    status: 200,
+    body: {
+      status: 'ok',
+      hasGeminiKey: !!apiKey,
+      model: apiKey ? GEMINI_MODEL : null,
+      engine: apiKey ? 'gemini' : 'rule-engine',
+    },
+  };
+}
+
+export async function handleAnalyze(payload: any): Promise<ApiResponse> {
+  const { asset, portfolio, userNotes } = payload ?? {};
 
   // Validation stricte : sans elle, un corps mal formé provoquait un TypeError
-  // à la lecture de `macd.histogram` et un 500 opaque côté client.
+  // à la lecture de `macd.histogram` et une erreur 500 opaque côté client.
   if (!asset || typeof asset !== 'object' || !portfolio || typeof portfolio !== 'object') {
-    return res.status(400).json({ error: 'Les paramètres "asset" et "portfolio" sont requis.' });
+    return { status: 400, body: { error: 'Les paramètres "asset" et "portfolio" sont requis.' } };
   }
   if (typeof asset.symbol !== 'string' || !asset.symbol) {
-    return res.status(400).json({ error: 'Le champ "asset.symbol" est requis.' });
+    return { status: 400, body: { error: 'Le champ "asset.symbol" est requis.' } };
   }
   if (!isFiniteNumber(asset.priceCAD) || asset.priceCAD <= 0) {
-    return res.status(400).json({ error: 'Le champ "asset.priceCAD" doit être un nombre strictement positif.' });
+    return { status: 400, body: { error: 'Le champ "asset.priceCAD" doit être un nombre strictement positif.' } };
   }
   if (!isFiniteNumber(portfolio.activeBudgetCAD) || portfolio.activeBudgetCAD < 0) {
-    return res.status(400).json({ error: 'Le champ "portfolio.activeBudgetCAD" doit être un nombre positif.' });
+    return { status: 400, body: { error: 'Le champ "portfolio.activeBudgetCAD" doit être un nombre positif.' } };
   }
 
   const safeAsset = {
@@ -399,13 +415,17 @@ router.post('/api/agents/analyze', async (req, res) => {
     maxRiskPercentPerTrade: isFiniteNumber(portfolio.maxRiskPercentPerTrade) ? portfolio.maxRiskPercentPerTrade : 2,
   };
 
-  if (!aiClient) {
-    return res.json({
-      success: true,
-      debate: runRuleEngine(safeAsset, safePortfolio),
-      mode: 'rule-engine',
-      notice: "Clé GEMINI_API_KEY absente : délibération produite par le moteur de règles déterministe.",
-    });
+  const client = getAiClient();
+  if (!client) {
+    return {
+      status: 200,
+      body: {
+        success: true,
+        debate: runRuleEngine(safeAsset, safePortfolio),
+        mode: 'rule-engine',
+        notice: "Clé GEMINI_API_KEY absente : délibération produite par le moteur de règles déterministe.",
+      },
+    };
   }
 
   const maxRiskAmountCAD = (safePortfolio.activeBudgetCAD * safePortfolio.maxRiskPercentPerTrade) / 100;
@@ -449,7 +469,7 @@ Fournissez l'analyse structurée dans le format JSON demandé.
 `;
 
   try {
-    const response = await aiClient.models.generateContent({
+    const response = await client.models.generateContent({
       model: GEMINI_MODEL,
       contents: promptText,
       config: {
@@ -466,31 +486,28 @@ Fournissez l'analyse structurée dans le format JSON demandé.
     const parsed = JSON.parse(text);
     if (!parsed?.finalDecision) throw new Error('Réponse du modèle sans décision finale');
 
-    return res.json({ success: true, debate: parsed, mode: 'gemini', model: GEMINI_MODEL });
+    return { status: 200, body: { success: true, debate: parsed, mode: 'gemini', model: GEMINI_MODEL } };
   } catch (err: any) {
-    // Repli explicite plutôt qu'un 500 : l'utilisateur obtient une décision
-    // exploitable et sait qu'elle ne vient pas du modèle.
-    console.error('[agents/analyze] échec Gemini, repli sur le moteur de règles :', err?.message || err);
-    return res.json({
-      success: true,
-      debate: runRuleEngine(safeAsset, safePortfolio),
-      mode: 'rule-engine',
-      notice: `Appel Gemini indisponible (${err?.message || 'erreur inconnue'}) : délibération produite par le moteur de règles déterministe.`,
-    });
+    // Repli explicite plutôt qu'une erreur 500 : l'utilisateur obtient une
+    // décision exploitable et sait qu'elle ne vient pas du modèle.
+    console.error('[analyze] échec Gemini, repli sur le moteur de règles :', err?.message || err);
+    return {
+      status: 200,
+      body: {
+        success: true,
+        debate: runRuleEngine(safeAsset, safePortfolio),
+        mode: 'rule-engine',
+        notice: `Appel Gemini indisponible (${err?.message || 'erreur inconnue'}) : délibération produite par le moteur de règles déterministe.`,
+      },
+    };
   }
-});
+}
 
-/**
- * Analyse de sentiment sur 7 jours. En l'absence de clé, la réponse indique
- * clairement que les scores proviennent du calcul technique local et non d'un
- * modèle — l'interface s'appuie sur ce champ pour ne pas afficher un badge
- * « Gemini » mensonger.
- */
-router.post('/api/agents/sentiment', async (req, res) => {
-  const { assets } = req.body ?? {};
+export async function handleSentiment(payload: any): Promise<ApiResponse> {
+  const { assets } = payload ?? {};
 
   if (!Array.isArray(assets) || assets.length === 0) {
-    return res.status(400).json({ error: 'Le champ "assets" doit être un tableau non vide.' });
+    return { status: 400, body: { error: 'Le champ "assets" doit être un tableau non vide.' } };
   }
 
   const symbols = assets
@@ -504,15 +521,16 @@ router.post('/api/agents/sentiment', async (req, res) => {
     }));
 
   if (symbols.length === 0) {
-    return res.status(400).json({ error: 'Aucun actif exploitable dans "assets".' });
+    return { status: 400, body: { error: 'Aucun actif exploitable dans "assets".' } };
   }
 
-  if (!aiClient) {
-    return res.json({ success: true, source: 'TECHNIQUE', scores: null });
+  const client = getAiClient();
+  if (!client) {
+    return { status: 200, body: { success: true, source: 'TECHNIQUE', scores: null } };
   }
 
   try {
-    const response = await aiClient.models.generateContent({
+    const response = await client.models.generateContent({
       model: GEMINI_MODEL,
       contents:
         `Évaluez le sentiment de marché sur 7 jours pour ces actifs, sur une échelle de 0 (capitulation) à 100 (euphorie). ` +
@@ -544,18 +562,18 @@ router.post('/api/agents/sentiment', async (req, res) => {
     const parsed = JSON.parse(response.text || '{}');
     if (!Array.isArray(parsed?.assets)) throw new Error('Réponse de sentiment mal formée');
 
-    return res.json({ success: true, source: 'GEMINI', scores: parsed.assets, model: GEMINI_MODEL });
+    return { status: 200, body: { success: true, source: 'GEMINI', scores: parsed.assets, model: GEMINI_MODEL } };
   } catch (err: any) {
-    console.error('[agents/sentiment] échec Gemini, repli technique :', err?.message || err);
-    return res.json({ success: true, source: 'TECHNIQUE', scores: null });
+    console.error('[sentiment] échec Gemini, repli technique :', err?.message || err);
+    return { status: 200, body: { success: true, source: 'TECHNIQUE', scores: null } };
   }
-});
+}
 
-router.post('/api/webhook/send', async (req, res) => {
-  const { webhookUrl, payload } = req.body ?? {};
+export async function handleWebhookSend(payload: any): Promise<ApiResponse> {
+  const { webhookUrl, payload: body } = payload ?? {};
 
-  if (typeof webhookUrl !== 'string' || !webhookUrl || payload === undefined) {
-    return res.status(400).json({ error: '"webhookUrl" et "payload" sont requis.' });
+  if (typeof webhookUrl !== 'string' || !webhookUrl || body === undefined) {
+    return { status: 400, body: { error: '"webhookUrl" et "payload" sont requis.' } };
   }
 
   let target: URL | null = null;
@@ -566,22 +584,21 @@ router.post('/api/webhook/send', async (req, res) => {
   }
 
   // Une URL non absolue reste simulée localement : c'est le mode « bac à sable »
-  // documenté dans l'interface.
+  // décrit dans l'interface.
   if (!target) {
-    return res.json({
-      status: 'SIMULATED',
-      statusCode: 200,
-      message: 'Webhook simulé localement (URL non absolue).',
-    });
+    return {
+      status: 200,
+      body: { status: 'SIMULATED', statusCode: 200, message: 'Webhook simulé localement (URL non absolue).' },
+    };
   }
 
   if (target.protocol !== 'https:' && target.protocol !== 'http:') {
-    return res.status(400).json({ error: 'Seuls les schémas http et https sont acceptés.' });
+    return { status: 400, body: { error: 'Seuls les schémas http et https sont acceptés.' } };
   }
 
   try {
-    // Sans délai maximal, un endpoint qui ne répond pas bloquait la requête
-    // jusqu'au timeout par défaut de Node.
+    // Sans délai maximal, un endpoint qui ne répond pas bloque la requête
+    // jusqu'au timeout par défaut de la plateforme.
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
 
@@ -590,37 +607,51 @@ router.post('/api/webhook/send', async (req, res) => {
       response = await fetch(target.toString(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
     } finally {
       clearTimeout(timeout);
     }
 
-    return res.json({
-      status: response.ok ? 'SUCCESS' : 'FAILED',
-      statusCode: response.status,
-      message: `Webhook transmis — réponse HTTP ${response.status}.`,
-    });
+    return {
+      status: 200,
+      body: {
+        status: response.ok ? 'SUCCESS' : 'FAILED',
+        statusCode: response.status,
+        message: `Webhook transmis — réponse HTTP ${response.status}.`,
+      },
+    };
   } catch (err: any) {
     const aborted = err?.name === 'AbortError';
-    return res.json({
-      status: 'FAILED',
-      statusCode: aborted ? 504 : 502,
-      message: aborted
-        ? "Délai dépassé : l'endpoint n'a pas répondu en moins de 10 s."
-        : `Erreur d'envoi du webhook : ${err?.message || 'inconnue'}`,
-    });
+    return {
+      status: 200,
+      body: {
+        status: 'FAILED',
+        statusCode: aborted ? 504 : 502,
+        message: aborted
+          ? "Délai dépassé : l'endpoint n'a pas répondu en moins de 10 s."
+          : `Erreur d'envoi du webhook : ${err?.message || 'inconnue'}`,
+      },
+    };
   }
-});
-/** Application Express complète exposant l'API, prête à être servie n'importe où. */
-export function createApiApp() {
-  const app = express();
-  app.use(express.json({ limit: '256kb' }));
-  app.use(router);
-  return app;
 }
 
-/** Indique si une clé Gemini est configurée (utilisé pour les journaux de démarrage). */
+/**
+ * Routage. `pathname` est comparé après normalisation, car selon l'hôte la
+ * requête peut arriver avec ou sans barre oblique finale.
+ */
+export async function dispatch(method: string, pathname: string, body: any): Promise<ApiResponse> {
+  const route = pathname.replace(/\/+$/, '') || '/';
+  const verb = method.toUpperCase();
+
+  if (route === '/api/health' && verb === 'GET') return handleHealth();
+  if (route === '/api/agents/analyze' && verb === 'POST') return handleAnalyze(body);
+  if (route === '/api/agents/sentiment' && verb === 'POST') return handleSentiment(body);
+  if (route === '/api/webhook/send' && verb === 'POST') return handleWebhookSend(body);
+
+  return { status: 404, body: { error: `Route inconnue : ${verb} ${route}` } };
+}
+
 export const hasGeminiKey = () => !!apiKey;
 export const geminiModel = () => GEMINI_MODEL;
