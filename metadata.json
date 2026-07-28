@@ -1,0 +1,6 @@
+{
+  "name": "Ferme de Trading Multi-Agents Intelligente",
+  "description": "Plateforme de gestion de portefeuille multi-agents ($ CAD) avec analyse technique, sentiment de marché, gestion des risques et scaling de capital.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
