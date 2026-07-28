@@ -1,12 +1,15 @@
-import React, { useState } from 'react';
-import { X, Layers, CheckSquare, Square, Zap, ShieldAlert, ArrowUpRight, ArrowDownRight, DollarSign, Check } from 'lucide-react';
+import React, { useState, useMemo } from 'react';
+import { X, Zap, ShieldAlert, ArrowUpRight, ArrowDownRight, Check } from 'lucide-react';
 import { MarketAsset, PortfolioSettings, TradePosition } from '../types';
+import { stopAndTargetFor } from '../lib/portfolio';
 
 interface MultiTradeModalProps {
   isOpen: boolean;
   onClose: () => void;
   watchlist: MarketAsset[];
   settings: PortfolioSettings;
+  openPositions: TradePosition[];
+  maxSlots: number;
   onExecuteMultiTrades: (newPositions: TradePosition[]) => void;
 }
 
@@ -15,103 +18,95 @@ export const MultiTradeModal: React.FC<MultiTradeModalProps> = ({
   onClose,
   watchlist,
   settings,
+  openPositions,
+  maxSlots,
   onExecuteMultiTrades,
 }) => {
-  const [selectedSymbols, setSelectedSymbols] = useState<string[]>(
-    watchlist.slice(0, 3).map((a) => a.symbol)
-  );
-  const [allocationPerTradeCAD, setAllocationPerTradeCAD] = useState<number>(250);
-  const [stopLossPercent, setStopLossPercent] = useState<number>(3);
-  const [takeProfitPercent, setTakeProfitPercent] = useState<number>(8);
+  const [selectedSymbols, setSelectedSymbols] = useState<string[]>([]);
+  const [allocationPerTradeCAD, setAllocationPerTradeCAD] = useState(250);
+  const [stopLossPercent, setStopLossPercent] = useState(3);
+  const [takeProfitPercent, setTakeProfitPercent] = useState(8);
   const [tradeType, setTradeType] = useState<'LONG' | 'SHORT'>('LONG');
+
+  const heldSymbols = useMemo(() => new Set(openPositions.map((p) => p.symbol)), [openPositions]);
+  const freeSlots = Math.max(0, maxSlots - openPositions.length);
+
+  /** Actifs réellement sélectionnables : ceux qui n'ont pas déjà une position ouverte. */
+  const selectableAssets = useMemo(
+    () => watchlist.filter((a) => !heldSymbols.has(a.symbol)),
+    [watchlist, heldSymbols]
+  );
+
+  const validSelection = useMemo(
+    () => selectedSymbols.filter((s) => selectableAssets.some((a) => a.symbol === s)),
+    [selectedSymbols, selectableAssets]
+  );
+
+  const totalRequiredCAD = Math.round(validSelection.length * allocationPerTradeCAD * 100) / 100;
+  const isBudgetSufficient = totalRequiredCAD <= settings.activeBudgetCAD;
+  const fitsInSlots = validSelection.length <= freeSlots;
+  const canSubmit = validSelection.length > 0 && isBudgetSufficient && fitsInSlots && allocationPerTradeCAD > 0;
 
   if (!isOpen) return null;
 
   const toggleSelectSymbol = (symbol: string) => {
-    if (selectedSymbols.includes(symbol)) {
-      setSelectedSymbols(selectedSymbols.filter((s) => s !== symbol));
-    } else {
-      setSelectedSymbols([...selectedSymbols, symbol]);
-    }
+    setSelectedSymbols((prev) => (prev.includes(symbol) ? prev.filter((s) => s !== symbol) : [...prev, symbol]));
   };
-
-  const selectAll = () => {
-    setSelectedSymbols(watchlist.map((a) => a.symbol));
-  };
-
-  const clearAll = () => {
-    setSelectedSymbols([]);
-  };
-
-  const totalRequiredCAD = selectedSymbols.length * allocationPerTradeCAD;
-  const isBudgetSufficient = totalRequiredCAD <= settings.activeBudgetCAD;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (selectedSymbols.length === 0) {
-      alert('Veuillez sélectionner au moins un actif pour lancer un trade simultané.');
-      return;
-    }
+    if (!canSubmit) return;
 
-    if (!isBudgetSufficient) {
-      alert(`Budget actif insuffisant (${settings.activeBudgetCAD} $ CAD). Requis: ${totalRequiredCAD} $ CAD.`);
-      return;
-    }
+    const now = Date.now();
+    const newPositions: TradePosition[] = validSelection.map((symbol, index) => {
+      const asset = selectableAssets.find((a) => a.symbol === symbol)!;
+      const decimals = asset.priceCAD < 10 ? 4 : 2;
 
-    const newPositions: TradePosition[] = selectedSymbols.map((sym) => {
-      const asset = watchlist.find((a) => a.symbol === sym)!;
-      const entryPrice = asset.priceCAD;
-      
-      const slPrice = tradeType === 'LONG'
-        ? Number((entryPrice * (1 - stopLossPercent / 100)).toFixed(2))
-        : Number((entryPrice * (1 + stopLossPercent / 100)).toFixed(2));
-      
-      const tpPrice = tradeType === 'LONG'
-        ? Number((entryPrice * (1 + takeProfitPercent / 100)).toFixed(2))
-        : Number((entryPrice * (1 - takeProfitPercent / 100)).toFixed(2));
-
-      const units = Number((allocationPerTradeCAD / entryPrice).toFixed(4));
+      // Pour un SHORT le stop est au-dessus du prix d'entrée et la cible en dessous.
+      const { stopLossCAD, takeProfitCAD } = stopAndTargetFor(
+        tradeType,
+        asset.priceCAD,
+        stopLossPercent,
+        takeProfitPercent,
+        decimals
+      );
 
       return {
-        id: `multi-${Date.now()}-${sym}-${Math.random()}`,
+        id: `multi-${now}-${index}-${Math.random().toString(36).slice(2, 8)}`,
         symbol: asset.symbol,
         assetName: asset.name,
         type: tradeType,
-        entryPriceCAD: entryPrice,
-        currentPriceCAD: entryPrice,
+        entryPriceCAD: asset.priceCAD,
+        currentPriceCAD: asset.priceCAD,
         amountCAD: allocationPerTradeCAD,
-        units,
-        stopLossCAD: slPrice,
-        takeProfitCAD: tpPrice,
-        openTime: new Date().toLocaleTimeString('fr-CA'),
+        units: Number((allocationPerTradeCAD / asset.priceCAD).toFixed(6)),
+        stopLossCAD,
+        takeProfitCAD,
+        openTime: new Date(now).toLocaleTimeString('fr-CA'),
+        openedAt: now,
         pnlCAD: 0,
         pnlPercent: 0,
+        source: 'MANUAL' as const,
       };
     });
 
     onExecuteMultiTrades(newPositions);
+    setSelectedSymbols([]);
     onClose();
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in">
-      <div className="bg-[#0a0a0a] border border-white/15 rounded-2xl w-full max-w-2xl overflow-hidden shadow-2xl space-y-0 text-white">
-        
-        {/* Header */}
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
+      <div className="bg-[#0a0a0a] border border-white/15 rounded-2xl w-full max-w-2xl overflow-hidden shadow-2xl text-white">
         <div className="flex items-center justify-between p-4 border-b border-white/10 bg-[#050505]">
           <div className="flex items-center space-x-2.5">
             <div className="p-2 bg-amber-500/10 text-amber-400 rounded-xl border border-amber-500/20">
               <Zap className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="font-bold text-white text-sm tracking-tight flex items-center gap-2">
-                Exécution Simultanée d'Ordres Multiple (Multi-Trades)
-                <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded-full font-mono">
-                  Simultané ⚡
-                </span>
-              </h3>
+              <h3 className="font-bold text-white text-sm tracking-tight">Exécution simultanée d'ordres multiples</h3>
               <p className="text-[11px] text-white/50">
-                Lancez plusieurs positions en un seul clic selon les limites de gestion du risque
+                {freeSlots} slot{freeSlots > 1 ? 's' : ''} libre{freeSlots > 1 ? 's' : ''} sur {maxSlots}
               </p>
             </div>
           </div>
@@ -123,142 +118,183 @@ export const MultiTradeModal: React.FC<MultiTradeModalProps> = ({
           </button>
         </div>
 
-        {/* Body Form */}
         <form onSubmit={handleSubmit} className="p-6 space-y-5 text-xs max-h-[80vh] overflow-y-auto">
-          
-          {/* Asset Multi-Selector Header */}
+          {/* Sélecteur de sens. Le champ existait dans l'état du composant mais
+              n'avait aucun contrôle associé : impossible d'ouvrir un SHORT. */}
+          <div className="space-y-2">
+            <label className="text-white font-bold block uppercase tracking-wider text-[11px]">Sens de la position</label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setTradeType('LONG')}
+                className={`p-3 rounded-xl border flex items-center justify-center space-x-2 font-bold transition-all ${
+                  tradeType === 'LONG'
+                    ? 'bg-emerald-500/15 border-emerald-500 text-emerald-300'
+                    : 'bg-[#111] border-white/10 text-white/50 hover:text-white'
+                }`}
+              >
+                <ArrowUpRight className="w-4 h-4" />
+                <span>Achat (LONG)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setTradeType('SHORT')}
+                className={`p-3 rounded-xl border flex items-center justify-center space-x-2 font-bold transition-all ${
+                  tradeType === 'SHORT'
+                    ? 'bg-rose-500/15 border-rose-500 text-rose-300'
+                    : 'bg-[#111] border-white/10 text-white/50 hover:text-white'
+                }`}
+              >
+                <ArrowDownRight className="w-4 h-4" />
+                <span>Vente à découvert (SHORT)</span>
+              </button>
+            </div>
+            <p className="text-[10px] text-white/40">
+              {tradeType === 'LONG'
+                ? 'Gain si le prix monte. Stop sous le prix d\'entrée, cible au-dessus.'
+                : "Gain si le prix baisse. Stop au-dessus du prix d'entrée, cible en dessous."}
+            </p>
+          </div>
+
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label className="text-white font-bold block uppercase tracking-wider text-[11px]">
-                Sélection des Actifs de la Ferme ({selectedSymbols.length} sélectionnés)
+                Actifs ({validSelection.length} sélectionné{validSelection.length > 1 ? 's' : ''})
               </label>
               <div className="flex items-center space-x-2 text-[11px]">
                 <button
                   type="button"
-                  onClick={selectAll}
+                  onClick={() => setSelectedSymbols(selectableAssets.slice(0, freeSlots).map((a) => a.symbol))}
                   className="text-[#00d2ff] hover:underline font-semibold"
                 >
-                  Tout sélectionner
+                  Remplir les slots
                 </button>
                 <span className="text-white/20">•</span>
                 <button
                   type="button"
-                  onClick={clearAll}
+                  onClick={() => setSelectedSymbols([])}
                   className="text-white/50 hover:text-white"
                 >
-                  Désélectionner tout
+                  Tout désélectionner
                 </button>
               </div>
             </div>
 
-            {/* Grid of assets with checkboxes */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 max-h-48 overflow-y-auto p-1 bg-[#050505] rounded-xl border border-white/10">
-              {watchlist.map((asset) => {
-                const isSelected = selectedSymbols.includes(asset.symbol);
-                return (
-                  <button
-                    key={asset.symbol}
-                    type="button"
-                    onClick={() => toggleSelectSymbol(asset.symbol)}
-                    className={`p-2.5 rounded-xl border text-left transition-all flex items-center justify-between ${
-                      isSelected
-                        ? 'bg-amber-500/15 border-amber-500 text-white font-bold'
-                        : 'bg-[#111] border-white/5 text-white/60 hover:text-white'
-                    }`}
-                  >
-                    <div>
-                      <div className="text-xs text-white font-mono">{asset.symbol}</div>
-                      <div className="text-[10px] text-white/50">{asset.priceCAD} $ CAD</div>
-                    </div>
-                    {isSelected ? (
-                      <div className="w-5 h-5 bg-amber-500 text-black rounded-lg flex items-center justify-center">
-                        <Check className="w-3.5 h-3.5 stroke-[3]" />
+            {selectableAssets.length === 0 ? (
+              <p className="text-white/50 bg-[#050505] rounded-xl border border-white/10 p-4 text-center">
+                Tous les actifs de la watchlist ont déjà une position ouverte.
+              </p>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 max-h-48 overflow-y-auto p-1 bg-[#050505] rounded-xl border border-white/10">
+                {selectableAssets.map((asset) => {
+                  const isSelected = selectedSymbols.includes(asset.symbol);
+                  return (
+                    <button
+                      key={asset.symbol}
+                      type="button"
+                      onClick={() => toggleSelectSymbol(asset.symbol)}
+                      className={`p-2.5 rounded-xl border text-left transition-all flex items-center justify-between ${
+                        isSelected
+                          ? 'bg-amber-500/15 border-amber-500 text-white font-bold'
+                          : 'bg-[#111] border-white/5 text-white/60 hover:text-white'
+                      }`}
+                    >
+                      <div>
+                        <div className="text-xs text-white font-mono">{asset.symbol}</div>
+                        <div className="text-[10px] text-white/50">{asset.priceCAD.toLocaleString('fr-CA')} $ CAD</div>
                       </div>
-                    ) : (
-                      <div className="w-5 h-5 border border-white/20 rounded-lg" />
-                    )}
-                  </button>
-                );
-              })}
-            </div>
+                      {isSelected ? (
+                        <div className="w-5 h-5 bg-amber-500 text-black rounded-lg flex items-center justify-center">
+                          <Check className="w-3.5 h-3.5 stroke-[3]" />
+                        </div>
+                      ) : (
+                        <div className="w-5 h-5 border border-white/20 rounded-lg" />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
-          {/* Allocation & Risk Settings per trade */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-[#111] p-4 rounded-xl border border-white/10">
-            
-            {/* Allocation CAD per trade */}
             <div className="space-y-1">
-              <label className="text-white/80 font-bold block text-[11px]">Capital par Trade ($ CAD)</label>
+              <label className="text-white/80 font-bold block text-[11px]">Capital par trade ($ CAD)</label>
               <input
                 type="number"
                 value={allocationPerTradeCAD}
-                onChange={(e) => setAllocationPerTradeCAD(Number(e.target.value))}
-                min={50}
-                step={50}
+                onChange={(e) => setAllocationPerTradeCAD(Math.max(1, Number(e.target.value) || 0))}
+                min={1}
+                // `step="any"` : avec un pas fixe, la validation native du navigateur
+                // rejette les montants qui ne tombent pas sur la grille (250 avec un
+                // pas de 50 partant de 1) et bloque l'envoi du formulaire sans message.
+                step="any"
                 className="w-full bg-[#050505] border border-white/15 rounded-xl px-3 py-2 text-amber-400 font-mono font-bold text-sm focus:outline-none focus:border-amber-500"
                 required
               />
-              <span className="text-[10px] text-white/40">ex: 250 $ CAD par position</span>
             </div>
 
-            {/* Stop Loss % */}
             <div className="space-y-1">
-              <label className="text-white/80 font-bold block text-[11px]">Stop-Loss (SL %)</label>
+              <label className="text-white/80 font-bold block text-[11px]">Stop-loss (%)</label>
               <input
                 type="number"
                 value={stopLossPercent}
-                onChange={(e) => setStopLossPercent(Number(e.target.value))}
-                min={1}
-                max={20}
+                onChange={(e) => setStopLossPercent(Math.min(50, Math.max(0.1, Number(e.target.value) || 0)))}
+                min={0.1}
+                max={50}
+                step="any"
                 className="w-full bg-[#050505] border border-white/15 rounded-xl px-3 py-2 text-rose-400 font-mono font-bold text-sm focus:outline-none focus:border-rose-500"
                 required
               />
-              <span className="text-[10px] text-white/40">Protection de capital</span>
             </div>
 
-            {/* Take Profit % */}
             <div className="space-y-1">
-              <label className="text-white/80 font-bold block text-[11px]">Take-Profit (TP %)</label>
+              <label className="text-white/80 font-bold block text-[11px]">Take-profit (%)</label>
               <input
                 type="number"
                 value={takeProfitPercent}
-                onChange={(e) => setTakeProfitPercent(Number(e.target.value))}
-                min={2}
-                max={50}
+                onChange={(e) => setTakeProfitPercent(Math.min(100, Math.max(0.1, Number(e.target.value) || 0)))}
+                min={0.1}
+                max={100}
+                step="any"
                 className="w-full bg-[#050505] border border-white/15 rounded-xl px-3 py-2 text-emerald-400 font-mono font-bold text-sm focus:outline-none focus:border-emerald-500"
                 required
               />
-              <span className="text-[10px] text-white/40">Objectif de gain</span>
             </div>
-
           </div>
 
-          {/* Budget Impact Summary */}
           <div className="bg-[#050505] p-3.5 rounded-xl border border-white/10 flex items-center justify-between font-mono text-xs">
             <div>
-              <span className="text-white/40 block text-[10px] uppercase">Engagement Requis</span>
+              <span className="text-white/40 block text-[10px] uppercase">Engagement requis</span>
               <span className="font-bold text-white text-base">
                 {totalRequiredCAD.toLocaleString('fr-CA')} $ CAD{' '}
-                <span className="text-white/40 text-xs">({selectedSymbols.length} positions)</span>
+                <span className="text-white/40 text-xs">({validSelection.length} positions)</span>
               </span>
             </div>
-
             <div className="text-right">
-              <span className="text-white/40 block text-[10px] uppercase">Budget Actif Disponible</span>
+              <span className="text-white/40 block text-[10px] uppercase">Budget actif disponible</span>
               <span className={`font-bold text-base ${isBudgetSufficient ? 'text-emerald-400' : 'text-rose-400'}`}>
                 {settings.activeBudgetCAD.toLocaleString('fr-CA')} $ CAD
               </span>
             </div>
           </div>
 
-          {/* Submit */}
-          <div className="pt-3 border-t border-white/10 flex items-center justify-between">
-            {!isBudgetSufficient && (
-              <span className="text-rose-400 text-[10px] font-semibold flex items-center gap-1">
-                <ShieldAlert className="w-3.5 h-3.5" />
-                Budget insuffisant. Ajustez l'allocation ou débloquez une tranche.
-              </span>
-            )}
+          <div className="pt-3 border-t border-white/10 flex flex-wrap items-center justify-between gap-3">
+            <div className="text-[10px] space-y-1">
+              {!isBudgetSufficient && (
+                <span className="text-rose-400 font-semibold flex items-center gap-1">
+                  <ShieldAlert className="w-3.5 h-3.5" />
+                  Budget insuffisant : réduisez l'allocation ou débloquez une tranche.
+                </span>
+              )}
+              {!fitsInSlots && (
+                <span className="text-amber-400 font-semibold flex items-center gap-1">
+                  <ShieldAlert className="w-3.5 h-3.5" />
+                  {validSelection.length} ordres pour {freeSlots} slot{freeSlots > 1 ? 's' : ''} disponible
+                  {freeSlots > 1 ? 's' : ''}.
+                </span>
+              )}
+            </div>
 
             <div className="flex items-center space-x-2 ml-auto">
               <button
@@ -270,17 +306,17 @@ export const MultiTradeModal: React.FC<MultiTradeModalProps> = ({
               </button>
               <button
                 type="submit"
-                disabled={!isBudgetSufficient || selectedSymbols.length === 0}
-                className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-black font-extrabold rounded-xl flex items-center space-x-2 shadow-lg transition-all"
+                disabled={!canSubmit}
+                className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed text-black font-extrabold rounded-xl flex items-center space-x-2 shadow-lg transition-all"
               >
                 <Zap className="w-4 h-4" />
-                <span>Lancer les {selectedSymbols.length} Trades Simultanés</span>
+                <span>
+                  Lancer {validSelection.length} ordre{validSelection.length > 1 ? 's' : ''} {tradeType}
+                </span>
               </button>
             </div>
           </div>
-
         </form>
-
       </div>
     </div>
   );

@@ -1,11 +1,13 @@
-import React, { useState } from 'react';
-import { X, Save, DollarSign, Target, Shield, Landmark } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, Save, Landmark, AlertTriangle } from 'lucide-react';
 import { PortfolioSettings } from '../types';
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   settings: PortfolioSettings;
+  /** Capital immobilisé dans les positions ouvertes : il ne peut pas être réalloué. */
+  committedCapitalCAD: number;
   onSaveSettings: (newSettings: PortfolioSettings) => void;
 }
 
@@ -13,6 +15,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
   onClose,
   settings,
+  committedCapitalCAD,
   onSaveSettings,
 }) => {
   const [totalCapital, setTotalCapital] = useState(settings.totalCapitalCAD);
@@ -22,11 +25,32 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [scalingProfitThreshold, setScalingProfitThreshold] = useState(settings.scalingProfitThresholdPercent);
   const [scalingTranche, setScalingTranche] = useState(settings.scalingTrancheAmountCAD);
 
+  /**
+   * Le formulaire est resynchronisé à chaque ouverture.
+   *
+   * Les `useState` ne s'initialisent qu'au montage : comme la modale reste montée
+   * en permanence, elle réaffichait les valeurs figées au premier rendu et
+   * écrasait, à l'enregistrement, tous les mouvements de capital survenus depuis.
+   */
+  useEffect(() => {
+    if (!isOpen) return;
+    setTotalCapital(settings.totalCapitalCAD);
+    setActiveBudget(settings.activeBudgetCAD);
+    setTargetGoal(settings.targetGoalCAD);
+    setMaxRiskPercent(settings.maxRiskPercentPerTrade);
+    setScalingProfitThreshold(settings.scalingProfitThresholdPercent);
+    setScalingTranche(settings.scalingTrancheAmountCAD);
+  }, [isOpen, settings]);
+
   if (!isOpen) return null;
+
+  const bankReserve = Math.max(0, totalCapital - activeBudget - committedCapitalCAD);
+  const isOverAllocated = activeBudget + committedCapitalCAD > totalCapital;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const bankReserve = Math.max(0, totalCapital - activeBudget);
+    if (isOverAllocated) return;
+
     onSaveSettings({
       totalCapitalCAD: Number(totalCapital),
       activeBudgetCAD: Number(activeBudget),
@@ -138,6 +162,29 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
+          {/* Répartition résultante, calculée en tenant compte du capital déjà engagé. */}
+          <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-1.5 font-mono text-[11px]">
+            <div className="flex justify-between text-slate-400">
+              <span>Capital engagé dans les positions ouvertes</span>
+              <span className="text-amber-400 font-bold">{committedCapitalCAD.toLocaleString('fr-CA')} $ CAD</span>
+            </div>
+            <div className="flex justify-between text-slate-400">
+              <span>Réserve bancaire résultante</span>
+              <span className="text-slate-200 font-bold">{bankReserve.toLocaleString('fr-CA')} $ CAD</span>
+            </div>
+          </div>
+
+          {isOverAllocated && (
+            <div className="flex items-start gap-2 p-3 rounded-xl border border-rose-500/40 bg-rose-500/10 text-rose-300 text-[11px]">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>
+                Le budget actif ({activeBudget.toLocaleString('fr-CA')} $) ajouté au capital engagé (
+                {committedCapitalCAD.toLocaleString('fr-CA')} $) dépasse le capital total. Augmentez le capital total ou
+                réduisez le budget actif.
+              </span>
+            </div>
+          )}
+
           {/* Submit Buttons */}
           <div className="pt-3 border-t border-slate-800 flex justify-end space-x-2">
             <button
@@ -149,7 +196,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </button>
             <button
               type="submit"
-              className="px-5 py-2 bg-gradient-to-r from-amber-500 to-emerald-400 hover:from-amber-400 hover:to-emerald-300 text-slate-950 font-extrabold rounded-xl flex items-center space-x-1.5 shadow-md transition-all"
+              disabled={isOverAllocated}
+              className="px-5 py-2 bg-gradient-to-r from-amber-500 to-emerald-400 hover:from-amber-400 hover:to-emerald-300 disabled:opacity-40 disabled:cursor-not-allowed text-slate-950 font-extrabold rounded-xl flex items-center space-x-1.5 shadow-md transition-all"
             >
               <Save className="w-4 h-4" />
               <span>Enregistrer et Mettre à Jour</span>

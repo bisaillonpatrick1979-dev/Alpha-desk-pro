@@ -1,19 +1,36 @@
 export type ActionType = 'BUY' | 'SELL' | 'HOLD' | 'CLOSE' | 'ACHETER' | 'RETIRER' | 'CONSERVER' | 'FERMER';
 
+/**
+ * Catégories d'actifs. Type unique partagé par la watchlist et les stratégies :
+ * les deux listes divergeaient, ce qui laissait des filtres de marché
+ * sélectionner des catégories qu'aucun actif ne portait.
+ */
+export type AssetCategory =
+  | 'CAD Stock'
+  | 'US Stock'
+  | 'Japan Stock'
+  | 'Australia Stock'
+  | 'Crypto'
+  | 'Forex'
+  | 'Commodities'
+  | 'Futures';
+
 export interface MarketAsset {
   symbol: string;
   name: string;
   priceCAD: number;
   change24h: number;
-  category: 'CAD Stock' | 'US Stock' | 'Japan Stock' | 'Australia Stock' | 'Crypto' | 'Forex' | 'Commodities' | 'Futures' | 'FX/Index';
+  category: AssetCategory;
   rsi: number;
   macd: { macdLine: number; signalLine: number; histogram: number };
-  ma50: number;
-  ma200: number;
+  ma50: number | null;
+  ma200: number | null;
   support: number;
   resistance: number;
   volume24h: string;
   history: MarketCandle[];
+  /** Clôture de référence servant de base au calcul de la variation 24 h. */
+  previousClose: number;
 }
 
 export interface InstitutionalEngineReport {
@@ -67,14 +84,13 @@ export interface InstitutionalWebhookPayload {
 
 export interface MarketCandle {
   time: string;
+  /** Époque en millisecondes — permet de trier et de rééchantillonner les séries. */
+  timestamp: number;
   open: number;
   high: number;
   low: number;
   close: number;
   volume: number;
-  ma50?: number;
-  ma200?: number;
-  rsi?: number;
 }
 
 export interface AgentDebateResult {
@@ -128,8 +144,12 @@ export interface TradePosition {
   stopLossCAD: number;
   takeProfitCAD: number;
   openTime: string;
+  /** Époque d'ouverture, pour dater précisément la position. */
+  openedAt: number;
   pnlCAD: number;
   pnlPercent: number;
+  /** Origine de l'ordre, affichée dans la table des positions. */
+  source?: 'AGENT' | 'MANUAL' | 'AUTOPILOT';
 }
 
 export interface HistoricalTrade {
@@ -143,7 +163,11 @@ export interface HistoricalTrade {
   pnlPercent: number;
   openTime: string;
   closeTime: string;
+  /** Époque de clôture — nécessaire pour reconstruire une courbe d'équité datée. */
+  closedAt: number;
   closeReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL' | 'SCALING_REBALANCE';
+  /** Origine de l'ordre, reprise depuis la position clôturée. */
+  source?: 'AGENT' | 'MANUAL' | 'AUTOPILOT';
 }
 
 export interface PortfolioSettings {
@@ -213,6 +237,39 @@ export interface AssetSentimentHeatmap {
   }[];
 }
 
+/** Origine des scores de sentiment affichés dans la heatmap. */
+export type SentimentSource = 'GEMINI' | 'TECHNIQUE';
+
+/** Point de la courbe d'équité, enregistré au fil de l'eau et persisté. */
+export interface EquitySnapshot {
+  /** Époque du relevé. */
+  t: number;
+  /** Capital total (P&L réalisé inclus). */
+  totalCapitalCAD: number;
+  /** Valeur liquidative = capital total + P&L latent. */
+  equityCAD: number;
+  activeBudgetCAD: number;
+  bankReserveCAD: number;
+}
+
+/** Résultat d'un backtest exécuté sur des bougies réelles. */
+export interface BacktestReport {
+  totalTrades: number;
+  winningTrades: number;
+  winRate: number;
+  maxDrawdownPercent: number;
+  totalProfitCAD: number;
+  returnPercent: number;
+  profitFactor: number;
+  sharpeRatio: number;
+  bestAsset: string;
+  worstAsset: string;
+  barsAnalysed: number;
+  assetsAnalysed: number;
+  strategyLabel: string;
+  equityCurve: { index: number; equity: number }[];
+}
+
 export type TradingStyle = 'SCALPING' | 'DAY_TRADING' | 'SWING_TRADING' | 'HFT_ARBITRAGE';
 
 export interface StrategyConfig {
@@ -229,7 +286,7 @@ export interface StrategyConfig {
   rsiSellThreshold: number;        // e.g. 70
   autoReinvestProfits: boolean;    // Auto-compounding
   maxDailyDrawdownCAD: number;     // Stop bot if loss > $ CAD
-  enabledMarkets: ('CAD Stock' | 'US Stock' | 'Japan Stock' | 'Australia Stock' | 'Crypto' | 'Forex' | 'Commodities' | 'Futures')[];
+  enabledMarkets: AssetCategory[];
 }
 
 export interface AutoBotLog {

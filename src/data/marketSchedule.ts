@@ -1,3 +1,5 @@
+import { mtDateISO, mtDayOfWeek, mtMinutesOfDay } from '../lib/time';
+
 export interface MarketScheduleInfo {
   id: string;
   code: 'US' | 'JP' | 'AU' | 'CA' | 'FOREX' | 'CRYPTO_COMMODITY';
@@ -191,27 +193,20 @@ export const WORLD_MARKETS_SCHEDULE: MarketScheduleInfo[] = [
   }
 ];
 
-// Helper to evaluate current status in Alberta MT
+// Évalue le statut courant d'un marché, en heure d'Alberta.
 export function calculateLiveMarketStatus(market: MarketScheduleInfo, date: Date = new Date()): MarketScheduleInfo['currentStatus'] {
-  // Check if today is a holiday first
-  const dateIso = date.toISOString().split('T')[0];
-  const holidayMatch = market.holidays.find(h => h.date === dateIso);
+  // `toISOString()` renvoie la date UTC : en soirée à Edmonton (UTC−6/−7) c'est
+  // déjà le lendemain, ce qui décalait la détection des jours fériés d'un jour.
+  const holidayMatch = market.holidays.find(h => h.date === mtDateISO(date));
   if (holidayMatch) {
     return 'JOUR_FÉRIÉ';
   }
 
-  // Calculate current minutes in Mountain Time (America/Edmonton)
-  const mtParts = date.toLocaleTimeString('en-US', {
-    timeZone: 'America/Edmonton',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).split(':');
-  const hours = parseInt(mtParts[0], 10);
-  const minutes = parseInt(mtParts[1], 10);
-  const timeInMinutes = hours * 60 + minutes;
+  const timeInMinutes = mtMinutesOfDay(date);
 
-  const dayOfWeek = date.getDay(); // 0 = Sunday, 6 = Saturday
+  // `getDay()` renvoie le jour dans le fuseau du navigateur, pas celui d'Alberta :
+  // un utilisateur à Tokyo voyait les marchés nord-américains ouverts le samedi.
+  const dayOfWeek = mtDayOfWeek(date);
 
   if (market.code === 'CRYPTO_COMMODITY') {
     return 'OUVERT';

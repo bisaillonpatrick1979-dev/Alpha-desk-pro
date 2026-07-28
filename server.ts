@@ -1,26 +1,25 @@
 import express from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '256kb' }));
 
-// Initialize Gemini Client server-side
+// Le modèle est configurable : un identifiant invalide ne doit pas nécessiter
+// un redéploiement du code.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+// Client Gemini initialisé côté serveur (la clé ne quitte jamais le backend).
 const apiKey = process.env.GEMINI_API_KEY;
 let aiClient: GoogleGenAI | null = null;
 if (apiKey) {
   aiClient = new GoogleGenAI({
-    apiKey: apiKey,
+    apiKey,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -29,46 +28,411 @@ if (apiKey) {
   });
 }
 
-// API Health
+const mtTimestamp = (date = new Date()) => {
+  const day = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Edmonton',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
+  const time = new Intl.DateTimeFormat('fr-CA', {
+    timeZone: 'America/Edmonton',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date);
+  return `${day} - ${time} MT`;
+};
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', hasGeminiKey: !!apiKey });
+  res.json({
+    status: 'ok',
+    hasGeminiKey: !!apiKey,
+    model: apiKey ? GEMINI_MODEL : null,
+    engine: apiKey ? 'gemini' : 'rule-engine',
+  });
 });
 
-// API Multi-Agent Analysis Endpoint
+/**
+ * Moteur de repli déterministe.
+ *
+ * Il sert dans deux cas : absence de clé API, mais aussi *échec* d'un appel
+ * Gemini (quota, modèle inconnu, réseau). Auparavant seul le premier cas était
+ * couvert et toute erreur d'API renvoyait un 500 : l'interface restait bloquée
+ * sur « Délibération… » sans jamais produire de décision.
+ */
+function runRuleEngine(asset: any, portfolio: any) {
+  const { symbol, priceCAD, rsi, macd, ma50, ma200, support, resistance } = asset;
+  const { activeBudgetCAD, maxRiskPercentPerTrade } = portfolio;
+
+  const riskPercent = maxRiskPercentPerTrade || 2;
+  const maxRiskAmountCAD = (activeBudgetCAD * riskPercent) / 100;
+
+  const histogram = macd?.histogram ?? 0;
+  const aboveTrend = ma50 !== null && ma50 !== undefined ? priceCAD > ma50 : true;
+
+  // Score technique borné, dérivé des indicateurs réellement reçus.
+  const rsiScore = rsi <= 30 ? 60 : rsi >= 70 ? -50 : (50 - Math.abs(rsi - 50)) * 1.2;
+  const macdScore = Math.max(-40, Math.min(40, histogram > 0 ? 30 : -30));
+  const trendScore = aboveTrend ? 25 : -25;
+  const qseScore = Math.max(-100, Math.min(100, Math.round(rsiScore + macdScore + trendScore)));
+
+  const smiScore = Math.max(-100, Math.min(100, Math.round(qseScore * 0.6)));
+  const croRiskFactor = rsi >= 70 || rsi <= 30 ? 40 : 20;
+  const confidenceScore = Math.round(qseScore * 0.5 + smiScore * 0.3 - croRiskFactor * 0.2);
+
+  const stopDistance = priceCAD * 0.03;
+  const stopLossPrice = Number((priceCAD - stopDistance).toFixed(2));
+  const takeProfitPrice = Number((priceCAD + stopDistance * 2.2).toFixed(2));
+
+  // Taille plafonnée par le risque autorisé ET par le budget disponible.
+  const sizeAtRiskLimit = (maxRiskAmountCAD / stopDistance) * priceCAD;
+  const positionSize = Number(Math.max(0, Math.min(sizeAtRiskLimit, activeBudgetCAD)).toFixed(2));
+
+  const isBuy = confidenceScore >= 60;
+  const stamp = mtTimestamp();
+
+  const webhookPayload = {
+    timestamp_mt: stamp,
+    engine_status: isBuy ? 'EXECUTED' : 'STANDBY',
+    confidence_score: confidenceScore,
+    slot_id: 1,
+    action: isBuy ? 'BUY' : 'HOLD',
+    symbol,
+    amount_cad: isBuy ? positionSize : 0,
+    stop_loss: stopLossPrice,
+    take_profit: takeProfitPrice,
+  };
+
+  const trendLabel = ma50 !== null && ma50 !== undefined ? `${ma50} $ CAD` : 'non disponible';
+  const ma200Label = ma200 !== null && ma200 !== undefined ? `${ma200} $ CAD` : 'non disponible';
+
+  return {
+    technicalAnalysis:
+      `Moteur Quantitatif QSE (Score ${qseScore}/100) : prix à ${priceCAD} $ CAD, RSI(14) = ${rsi}, ` +
+      `histogramme MACD = ${histogram}. MM50 ${trendLabel}, MM200 ${ma200Label}. ` +
+      `Support ${support} $ CAD, résistance ${resistance} $ CAD. ` +
+      `${aboveTrend ? 'Cours au-dessus de la MM50 : structure haussière.' : 'Cours sous la MM50 : structure prudente.'}`,
+    sentimentAnalysis:
+      `Moteur Sentiment SMI (Score ${smiScore}/100) : en l'absence de flux de nouvelles connecté, ` +
+      `le score est dérivé du momentum technique et non d'une analyse de presse.`,
+    riskManagement: {
+      text:
+        `Moteur CRO : risque autorisé ${riskPercent} % du budget actif (${maxRiskAmountCAD.toFixed(2)} $ CAD). ` +
+        `Taille conforme : ${positionSize} $ CAD. Ratio risque/rendement 1:2.2. ` +
+        `SL ${stopLossPrice} $ CAD, TP ${takeProfitPrice} $ CAD.`,
+      suggestedRiskPercent: riskPercent,
+      suggestedPositionSizeCAD: positionSize,
+      stopLossPrice,
+      takeProfitPrice,
+    },
+    finalDecision: {
+      action: isBuy ? 'ACHETER' : 'CONSERVER',
+      actionEnglish: isBuy ? 'BUY' : 'HOLD',
+      symbol,
+      positionSizeCAD: isBuy ? positionSize : 0,
+      stopLossPrice,
+      takeProfitPrice,
+      scalingRecommendation:
+        'Le déblocage de tranche est piloté par le seuil de scaling configuré dans les paramètres du portefeuille.',
+      shouldScaleUp: false,
+      scaleAmountCAD: 0,
+      reasoning: isBuy
+        ? `Score de confiance CIO à ${confidenceScore}/100 (seuil +60 franchi). Ordre d'achat déclenché.`
+        : `Score de confiance CIO à ${confidenceScore}/100, sous le seuil de +60. Aucune position initiée.`,
+    },
+    webhookPayload,
+    institutionalReport: {
+      timestampMT: stamp,
+      qseEngine: {
+        score: qseScore,
+        technicalDetails: `RSI(14) = ${rsi}, MACD histogramme = ${histogram}, MM50 ${trendLabel}, MM200 ${ma200Label}.`,
+        marketRegime: aboveTrend ? 'Tendance Haussière' : 'Range / Consolidation',
+      },
+      smiEngine: {
+        score: smiScore,
+        sentimentDetails: 'Score dérivé du momentum technique (aucun fournisseur de nouvelles connecté).',
+        macroImpact: 'Contexte macroéconomique non évalué en mode moteur de règles.',
+      },
+      croEngine: {
+        vetoStatus: positionSize > 0 ? 'APPROVED' : 'VETOED',
+        slotAssigned: 1,
+        slotCorrelationCheck: 'Contrôle de corrélation non applicable en mode moteur de règles.',
+        riskPerTradePercent: riskPercent,
+        riskRewardRatio: '1:2.2',
+        stopLossPriceCAD: stopLossPrice,
+        takeProfitPriceCAD: takeProfitPrice,
+        riskDetails: `Exposition maximale ${maxRiskAmountCAD.toFixed(2)} $ CAD pour une distance de stop de ${stopDistance.toFixed(2)} $ CAD.`,
+      },
+      cioEngine: {
+        globalConfidenceScore: confidenceScore,
+        finalDecision: isBuy ? 'ACHETEUR' : 'NEUTRE',
+        decisionEnglish: isBuy ? 'BUY' : 'HOLD',
+        capitalScalingRecommendation: 'Scaling piloté par les paramètres du portefeuille.',
+        shouldScaleUp: false,
+        reasoning: `(${qseScore} × 0,50) + (${smiScore} × 0,30) − (${croRiskFactor} × 0,20) = ${confidenceScore}/100`,
+      },
+      aeeEngine: {
+        orderType: 'LIMIT',
+        estimatedHorizon: 'Intraday',
+        webhookPayload,
+      },
+    },
+  };
+}
+
+const responseSchema = {
+  type: Type.OBJECT,
+  properties: {
+    technicalAnalysis: { type: Type.STRING },
+    sentimentAnalysis: { type: Type.STRING },
+    riskManagement: {
+      type: Type.OBJECT,
+      properties: {
+        text: { type: Type.STRING },
+        suggestedRiskPercent: { type: Type.NUMBER },
+        suggestedPositionSizeCAD: { type: Type.NUMBER },
+        stopLossPrice: { type: Type.NUMBER },
+        takeProfitPrice: { type: Type.NUMBER },
+      },
+      required: ['text', 'suggestedRiskPercent', 'suggestedPositionSizeCAD', 'stopLossPrice', 'takeProfitPrice'],
+    },
+    finalDecision: {
+      type: Type.OBJECT,
+      properties: {
+        action: { type: Type.STRING },
+        actionEnglish: { type: Type.STRING },
+        symbol: { type: Type.STRING },
+        positionSizeCAD: { type: Type.NUMBER },
+        stopLossPrice: { type: Type.NUMBER },
+        takeProfitPrice: { type: Type.NUMBER },
+        scalingRecommendation: { type: Type.STRING },
+        shouldScaleUp: { type: Type.BOOLEAN },
+        scaleAmountCAD: { type: Type.NUMBER },
+        reasoning: { type: Type.STRING },
+      },
+      required: [
+        'action',
+        'actionEnglish',
+        'symbol',
+        'positionSizeCAD',
+        'stopLossPrice',
+        'takeProfitPrice',
+        'scalingRecommendation',
+        'shouldScaleUp',
+        'reasoning',
+      ],
+    },
+    webhookPayload: {
+      type: Type.OBJECT,
+      properties: {
+        timestamp_mt: { type: Type.STRING },
+        engine_status: { type: Type.STRING },
+        confidence_score: { type: Type.NUMBER },
+        slot_id: { type: Type.NUMBER },
+        action: { type: Type.STRING },
+        symbol: { type: Type.STRING },
+        amount_cad: { type: Type.NUMBER },
+        stop_loss: { type: Type.NUMBER },
+        take_profit: { type: Type.NUMBER },
+      },
+      required: [
+        'timestamp_mt',
+        'engine_status',
+        'confidence_score',
+        'slot_id',
+        'action',
+        'symbol',
+        'amount_cad',
+        'stop_loss',
+        'take_profit',
+      ],
+    },
+    institutionalReport: {
+      type: Type.OBJECT,
+      properties: {
+        timestampMT: { type: Type.STRING },
+        qseEngine: {
+          type: Type.OBJECT,
+          properties: {
+            score: { type: Type.NUMBER },
+            technicalDetails: { type: Type.STRING },
+            marketRegime: { type: Type.STRING },
+          },
+          required: ['score', 'technicalDetails', 'marketRegime'],
+        },
+        smiEngine: {
+          type: Type.OBJECT,
+          properties: {
+            score: { type: Type.NUMBER },
+            sentimentDetails: { type: Type.STRING },
+            macroImpact: { type: Type.STRING },
+          },
+          required: ['score', 'sentimentDetails', 'macroImpact'],
+        },
+        croEngine: {
+          type: Type.OBJECT,
+          properties: {
+            vetoStatus: { type: Type.STRING },
+            slotAssigned: { type: Type.NUMBER },
+            slotCorrelationCheck: { type: Type.STRING },
+            riskPerTradePercent: { type: Type.NUMBER },
+            riskRewardRatio: { type: Type.STRING },
+            stopLossPriceCAD: { type: Type.NUMBER },
+            takeProfitPriceCAD: { type: Type.NUMBER },
+            riskDetails: { type: Type.STRING },
+          },
+          required: [
+            'vetoStatus',
+            'slotAssigned',
+            'slotCorrelationCheck',
+            'riskPerTradePercent',
+            'riskRewardRatio',
+            'stopLossPriceCAD',
+            'takeProfitPriceCAD',
+            'riskDetails',
+          ],
+        },
+        cioEngine: {
+          type: Type.OBJECT,
+          properties: {
+            globalConfidenceScore: { type: Type.NUMBER },
+            finalDecision: { type: Type.STRING },
+            decisionEnglish: { type: Type.STRING },
+            capitalScalingRecommendation: { type: Type.STRING },
+            shouldScaleUp: { type: Type.BOOLEAN },
+            reasoning: { type: Type.STRING },
+          },
+          required: [
+            'globalConfidenceScore',
+            'finalDecision',
+            'decisionEnglish',
+            'capitalScalingRecommendation',
+            'shouldScaleUp',
+            'reasoning',
+          ],
+        },
+        aeeEngine: {
+          type: Type.OBJECT,
+          properties: {
+            orderType: { type: Type.STRING },
+            estimatedHorizon: { type: Type.STRING },
+            webhookPayload: {
+              type: Type.OBJECT,
+              properties: {
+                timestamp_mt: { type: Type.STRING },
+                engine_status: { type: Type.STRING },
+                confidence_score: { type: Type.NUMBER },
+                slot_id: { type: Type.NUMBER },
+                action: { type: Type.STRING },
+                symbol: { type: Type.STRING },
+                amount_cad: { type: Type.NUMBER },
+                stop_loss: { type: Type.NUMBER },
+                take_profit: { type: Type.NUMBER },
+              },
+              required: [
+                'timestamp_mt',
+                'engine_status',
+                'confidence_score',
+                'slot_id',
+                'action',
+                'symbol',
+                'amount_cad',
+                'stop_loss',
+                'take_profit',
+              ],
+            },
+          },
+          required: ['orderType', 'estimatedHorizon', 'webhookPayload'],
+        },
+      },
+      required: ['timestampMT', 'qseEngine', 'smiEngine', 'croEngine', 'cioEngine', 'aeeEngine'],
+    },
+  },
+  required: ['technicalAnalysis', 'sentimentAnalysis', 'riskManagement', 'finalDecision', 'webhookPayload'],
+};
+
 app.post('/api/agents/analyze', async (req, res) => {
-  try {
-    const { asset, portfolio, userNotes } = req.body;
+  const { asset, portfolio, userNotes } = req.body ?? {};
 
-    if (!asset || !portfolio) {
-      return res.status(400).json({ error: 'Asset and portfolio parameters are required' });
-    }
+  // Validation stricte : sans elle, un corps mal formé provoquait un TypeError
+  // à la lecture de `macd.histogram` et un 500 opaque côté client.
+  if (!asset || typeof asset !== 'object' || !portfolio || typeof portfolio !== 'object') {
+    return res.status(400).json({ error: 'Les paramètres "asset" et "portfolio" sont requis.' });
+  }
+  if (typeof asset.symbol !== 'string' || !asset.symbol) {
+    return res.status(400).json({ error: 'Le champ "asset.symbol" est requis.' });
+  }
+  if (!isFiniteNumber(asset.priceCAD) || asset.priceCAD <= 0) {
+    return res.status(400).json({ error: 'Le champ "asset.priceCAD" doit être un nombre strictement positif.' });
+  }
+  if (!isFiniteNumber(portfolio.activeBudgetCAD) || portfolio.activeBudgetCAD < 0) {
+    return res.status(400).json({ error: 'Le champ "portfolio.activeBudgetCAD" doit être un nombre positif.' });
+  }
 
-    const { symbol, name, priceCAD, rsi, macd, ma50, ma200, support, resistance } = asset;
-    const { totalCapitalCAD, activeBudgetCAD, bankReserveCAD, targetGoalCAD, maxRiskPercentPerTrade } = portfolio;
+  const safeAsset = {
+    ...asset,
+    rsi: isFiniteNumber(asset.rsi) ? asset.rsi : 50,
+    macd: {
+      macdLine: isFiniteNumber(asset.macd?.macdLine) ? asset.macd.macdLine : 0,
+      signalLine: isFiniteNumber(asset.macd?.signalLine) ? asset.macd.signalLine : 0,
+      histogram: isFiniteNumber(asset.macd?.histogram) ? asset.macd.histogram : 0,
+    },
+    ma50: isFiniteNumber(asset.ma50) ? asset.ma50 : null,
+    ma200: isFiniteNumber(asset.ma200) ? asset.ma200 : null,
+    support: isFiniteNumber(asset.support) ? asset.support : asset.priceCAD * 0.95,
+    resistance: isFiniteNumber(asset.resistance) ? asset.resistance : asset.priceCAD * 1.05,
+  };
 
-    const maxRiskAmountCAD = (activeBudgetCAD * (maxRiskPercentPerTrade || 2)) / 100;
+  const safePortfolio = {
+    totalCapitalCAD: isFiniteNumber(portfolio.totalCapitalCAD) ? portfolio.totalCapitalCAD : 0,
+    activeBudgetCAD: portfolio.activeBudgetCAD,
+    bankReserveCAD: isFiniteNumber(portfolio.bankReserveCAD) ? portfolio.bankReserveCAD : 0,
+    targetGoalCAD: isFiniteNumber(portfolio.targetGoalCAD) ? portfolio.targetGoalCAD : 0,
+    maxRiskPercentPerTrade: isFiniteNumber(portfolio.maxRiskPercentPerTrade) ? portfolio.maxRiskPercentPerTrade : 2,
+  };
 
-    const promptText = `
+  if (!aiClient) {
+    return res.json({
+      success: true,
+      debate: runRuleEngine(safeAsset, safePortfolio),
+      mode: 'rule-engine',
+      notice: "Clé GEMINI_API_KEY absente : délibération produite par le moteur de règles déterministe.",
+    });
+  }
+
+  const maxRiskAmountCAD = (safePortfolio.activeBudgetCAD * safePortfolio.maxRiskPercentPerTrade) / 100;
+  const notes = typeof userNotes === 'string' ? userNotes.slice(0, 2000) : '';
+
+  const promptText = `
 Vous êtes la plateforme de trading autonome "ALPHA-DESK PRO", configurée selon la structure décisionnelle des plus grandes firmes de trading quantitatif et de hedge funds.
 Localisation & Timezone : Alberta, Canada (Mountain Time - MT).
 Devise Universelle : Dollar Canadien ($ CAD).
 
 ### PARAMÈTRES DU PORTEFEUILLE ACTUEL :
-- Capital Total Réserve (Banque Globale) : ${totalCapitalCAD} $ CAD
-- Budget Actif de Départ (Capital Risqué) : ${activeBudgetCAD} $ CAD
-- Réserve en Banque : ${bankReserveCAD} $ CAD
-- Objectif de Rentabilité : ${targetGoalCAD} $ CAD
-- Risque Max par trade : ${maxRiskPercentPerTrade || 2}% du Budget Actif (${maxRiskAmountCAD.toFixed(2)} $ CAD max à risquer)
+- Capital Total Réserve (Banque Globale) : ${safePortfolio.totalCapitalCAD} $ CAD
+- Budget Actif de Départ (Capital Risqué) : ${safePortfolio.activeBudgetCAD} $ CAD
+- Réserve en Banque : ${safePortfolio.bankReserveCAD} $ CAD
+- Objectif de Rentabilité : ${safePortfolio.targetGoalCAD} $ CAD
+- Risque Max par trade : ${safePortfolio.maxRiskPercentPerTrade}% du Budget Actif (${maxRiskAmountCAD.toFixed(2)} $ CAD max à risquer)
 - Capacité Portefeuille : 5 Slots Simultanés (#1 à #5)
 
 ### DONNÉES DU MARCHÉ POUR L'ACTIF :
-- Symbole : ${symbol} (${name})
-- Prix Actuel : ${priceCAD} $ CAD
-- RSI (14) : ${rsi}
-- MACD : Line ${macd.macdLine}, Signal ${macd.signalLine}, Hist ${macd.histogram}
-- MM50 : ${ma50} $ CAD | MM200 : ${ma200} $ CAD
-- Support Clé : ${support} $ CAD | Résistance Clé : ${resistance} $ CAD
-${userNotes ? `- Notes additionnelles/Contexte: "${userNotes}"` : ''}
+- Symbole : ${safeAsset.symbol} (${safeAsset.name ?? safeAsset.symbol})
+- Prix Actuel : ${safeAsset.priceCAD} $ CAD
+- RSI (14) : ${safeAsset.rsi}
+- MACD : Line ${safeAsset.macd.macdLine}, Signal ${safeAsset.macd.signalLine}, Hist ${safeAsset.macd.histogram}
+- MM50 : ${safeAsset.ma50 ?? 'n/d'} $ CAD | MM200 : ${safeAsset.ma200 ?? 'n/d'} $ CAD
+- Support Clé : ${safeAsset.support} $ CAD | Résistance Clé : ${safeAsset.resistance} $ CAD
+${notes ? `- Notes additionnelles/Contexte: "${notes}"` : ''}
+
+Contraintes impératives :
+- La taille de position recommandée ne doit jamais dépasser ${safePortfolio.activeBudgetCAD} $ CAD (budget actif disponible).
+- La perte maximale au stop ne doit jamais dépasser ${maxRiskAmountCAD.toFixed(2)} $ CAD.
+- N'affirmez pas disposer d'informations de presse ou macroéconomiques que vous n'avez pas ; en leur absence, dites-le explicitement.
 
 Consignes de délibération des 5 MOTEURS INSTITUTIONNELS :
 1. MOTEUR 1 - Quantitative & Signal Engine (QSE) : Analyse technique, régime de marché (Tendance Haussière, Baissière, Range, Volatilité Extrême), score QSE (-100 à +100).
@@ -80,293 +444,186 @@ Consignes de délibération des 5 MOTEURS INSTITUTIONNELS :
 Fournissez l'analyse structurée dans le format JSON demandé.
 `;
 
-    if (aiClient) {
-      const response = await aiClient.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: promptText,
-        config: {
-          systemInstruction: 'Vous êtes ALPHA-DESK PRO, le moteur institutionnel multi-agents de trading quantitatif en $ CAD (Alberta, Canada - Mountain Time MT). Vous produisez des délibérations rigoureuses.',
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              technicalAnalysis: { type: Type.STRING },
-              sentimentAnalysis: { type: Type.STRING },
-              riskManagement: {
-                type: Type.OBJECT,
-                properties: {
-                  text: { type: Type.STRING },
-                  suggestedRiskPercent: { type: Type.NUMBER },
-                  suggestedPositionSizeCAD: { type: Type.NUMBER },
-                  stopLossPrice: { type: Type.NUMBER },
-                  takeProfitPrice: { type: Type.NUMBER },
-                },
-                required: ['text', 'suggestedRiskPercent', 'suggestedPositionSizeCAD', 'stopLossPrice', 'takeProfitPrice'],
-              },
-              finalDecision: {
-                type: Type.OBJECT,
-                properties: {
-                  action: { type: Type.STRING },
-                  actionEnglish: { type: Type.STRING },
-                  symbol: { type: Type.STRING },
-                  positionSizeCAD: { type: Type.NUMBER },
-                  stopLossPrice: { type: Type.NUMBER },
-                  takeProfitPrice: { type: Type.NUMBER },
-                  scalingRecommendation: { type: Type.STRING },
-                  shouldScaleUp: { type: Type.BOOLEAN },
-                  scaleAmountCAD: { type: Type.NUMBER },
-                  reasoning: { type: Type.STRING },
-                },
-                required: ['action', 'actionEnglish', 'symbol', 'positionSizeCAD', 'stopLossPrice', 'takeProfitPrice', 'scalingRecommendation', 'shouldScaleUp', 'reasoning'],
-              },
-              webhookPayload: {
-                type: Type.OBJECT,
-                properties: {
-                  timestamp_mt: { type: Type.STRING },
-                  engine_status: { type: Type.STRING },
-                  confidence_score: { type: Type.NUMBER },
-                  slot_id: { type: Type.NUMBER },
-                  action: { type: Type.STRING },
-                  symbol: { type: Type.STRING },
-                  amount_cad: { type: Type.NUMBER },
-                  stop_loss: { type: Type.NUMBER },
-                  take_profit: { type: Type.NUMBER },
-                },
-                required: ['timestamp_mt', 'engine_status', 'confidence_score', 'slot_id', 'action', 'symbol', 'amount_cad', 'stop_loss', 'take_profit'],
-              },
-              institutionalReport: {
-                type: Type.OBJECT,
-                properties: {
-                  timestampMT: { type: Type.STRING },
-                  qseEngine: {
-                    type: Type.OBJECT,
-                    properties: {
-                      score: { type: Type.NUMBER },
-                      technicalDetails: { type: Type.STRING },
-                      marketRegime: { type: Type.STRING },
-                    },
-                    required: ['score', 'technicalDetails', 'marketRegime'],
-                  },
-                  smiEngine: {
-                    type: Type.OBJECT,
-                    properties: {
-                      score: { type: Type.NUMBER },
-                      sentimentDetails: { type: Type.STRING },
-                      macroImpact: { type: Type.STRING },
-                    },
-                    required: ['score', 'sentimentDetails', 'macroImpact'],
-                  },
-                  croEngine: {
-                    type: Type.OBJECT,
-                    properties: {
-                      vetoStatus: { type: Type.STRING },
-                      slotAssigned: { type: Type.NUMBER },
-                      slotCorrelationCheck: { type: Type.STRING },
-                      riskPerTradePercent: { type: Type.NUMBER },
-                      riskRewardRatio: { type: Type.STRING },
-                      stopLossPriceCAD: { type: Type.NUMBER },
-                      takeProfitPriceCAD: { type: Type.NUMBER },
-                      riskDetails: { type: Type.STRING },
-                    },
-                    required: ['vetoStatus', 'slotAssigned', 'slotCorrelationCheck', 'riskPerTradePercent', 'riskRewardRatio', 'stopLossPriceCAD', 'takeProfitPriceCAD', 'riskDetails'],
-                  },
-                  cioEngine: {
-                    type: Type.OBJECT,
-                    properties: {
-                      globalConfidenceScore: { type: Type.NUMBER },
-                      finalDecision: { type: Type.STRING },
-                      decisionEnglish: { type: Type.STRING },
-                      capitalScalingRecommendation: { type: Type.STRING },
-                      shouldScaleUp: { type: Type.BOOLEAN },
-                      reasoning: { type: Type.STRING },
-                    },
-                    required: ['globalConfidenceScore', 'finalDecision', 'decisionEnglish', 'capitalScalingRecommendation', 'shouldScaleUp', 'reasoning'],
-                  },
-                  aeeEngine: {
-                    type: Type.OBJECT,
-                    properties: {
-                      orderType: { type: Type.STRING },
-                      estimatedHorizon: { type: Type.STRING },
-                      webhookPayload: {
-                        type: Type.OBJECT,
-                        properties: {
-                          timestamp_mt: { type: Type.STRING },
-                          engine_status: { type: Type.STRING },
-                          confidence_score: { type: Type.NUMBER },
-                          slot_id: { type: Type.NUMBER },
-                          action: { type: Type.STRING },
-                          symbol: { type: Type.STRING },
-                          amount_cad: { type: Type.NUMBER },
-                          stop_loss: { type: Type.NUMBER },
-                          take_profit: { type: Type.NUMBER },
-                        },
-                        required: ['timestamp_mt', 'engine_status', 'confidence_score', 'slot_id', 'action', 'symbol', 'amount_cad', 'stop_loss', 'take_profit'],
-                      },
-                    },
-                    required: ['orderType', 'estimatedHorizon', 'webhookPayload'],
-                  },
-                },
-                required: ['timestampMT', 'qseEngine', 'smiEngine', 'croEngine', 'cioEngine', 'aeeEngine'],
-              },
-            },
-            required: ['technicalAnalysis', 'sentimentAnalysis', 'riskManagement', 'finalDecision', 'webhookPayload'],
-          },
-        },
-      });
+  try {
+    const response = await aiClient.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: promptText,
+      config: {
+        systemInstruction:
+          'Vous êtes ALPHA-DESK PRO, le moteur institutionnel multi-agents de trading quantitatif en $ CAD (Alberta, Canada - Mountain Time MT). Vous produisez des délibérations rigoureuses.',
+        responseMimeType: 'application/json',
+        responseSchema,
+      },
+    });
 
-      const parsedResult = JSON.parse(response.text || '{}');
-      return res.json({ success: true, debate: parsedResult });
-    } else {
-      // Fallback Engine if AI Client is unavailable or env key missing
-      const isBullish = rsi < 70 && macd.histogram > 0 && priceCAD > ma50;
-      const qseScore = isBullish ? 75 : -30;
-      const smiScore = isBullish ? 65 : -15;
-      const croRiskFactor = 20;
-      const confidenceScore = Math.round((qseScore * 0.50) + (smiScore * 0.30) - (croRiskFactor * 0.20));
+    const text = response.text;
+    if (!text) throw new Error('Réponse vide du modèle');
 
-      const slDist = priceCAD * 0.03; // 3% stop distance
-      const stopLossPrice = Number((priceCAD - slDist).toFixed(2));
-      const takeProfitPrice = Number((priceCAD + slDist * 2.2).toFixed(2));
-      const posSize = Number(Math.min(activeBudgetCAD * 0.25, (maxRiskAmountCAD / 0.03)).toFixed(2));
+    const parsed = JSON.parse(text);
+    if (!parsed?.finalDecision) throw new Error('Réponse du modèle sans décision finale');
 
-      const nowMT = new Date().toLocaleString('en-US', { timeZone: 'America/Edmonton' });
-      const mtFormatted = `${nowMT} MT`;
-
-      const fallbackDebate = {
-        technicalAnalysis: `Moteur Quantitatif QSE (Score: ${qseScore}/100) : Prix à ${priceCAD} $ CAD. RSI=${rsi}, MACD Hist=${macd.histogram}. MM50=${ma50} $ CAD, MM200=${ma200} $ CAD. Support ${support} $ CAD, Résistance ${resistance} $ CAD. ${isBullish ? 'Tendance haussière confirmée au-dessus de la MM50.' : 'Zone de consolidation neutre/prudente.'}`,
-        sentimentAnalysis: `Moteur Sentiment SMI (Score: ${smiScore}/100) : Sentiment général ${isBullish ? 'favorable avec flux d achats institutionnels' : 'neutre'} sur le marché canadien/US.`,
-        riskManagement: {
-          text: `Moteur CRO (Chief Risk Officer) : Risque autorisé 2.0% du budget actif (${maxRiskAmountCAD.toFixed(2)} $ CAD). Taille allouée : ${posSize} $ CAD. Ratio Risque/Rendement calculé : 1:2.2 (Conforme au seuil 1:2). SL: ${stopLossPrice} $ CAD, TP: ${takeProfitPrice} $ CAD.`,
-          suggestedRiskPercent: maxRiskPercentPerTrade || 2,
-          suggestedPositionSizeCAD: posSize,
-          stopLossPrice: stopLossPrice,
-          takeProfitPrice: takeProfitPrice,
-        },
-        finalDecision: {
-          action: confidenceScore >= 60 ? 'ACHETER' : 'CONSERVER',
-          actionEnglish: confidenceScore >= 60 ? 'BUY' : 'HOLD',
-          symbol,
-          positionSizeCAD: confidenceScore >= 60 ? posSize : 0,
-          stopLossPrice,
-          takeProfitPrice,
-          scalingRecommendation: activeBudgetCAD >= 1150 ? 'Objectif +15% atteint. Déblocage d une tranche de 1 000 $ CAD recommandé depuis la Reserve Globale.' : 'Budget actif stable. Continuer l accumulation contrôlée.',
-          shouldScaleUp: activeBudgetCAD >= 1150,
-          scaleAmountCAD: 1000,
-          reasoning: confidenceScore >= 60 ? `Score de confiance CIO à ${confidenceScore}/100 (> +60). Déclenchement automatique de l ordre d achat.` : `Score de confiance CIO à ${confidenceScore}/100. En attente de confirmation.`,
-        },
-        webhookPayload: {
-          timestamp_mt: mtFormatted,
-          engine_status: 'EXECUTED',
-          confidence_score: confidenceScore,
-          slot_id: 1,
-          action: confidenceScore >= 60 ? 'BUY' : 'HOLD',
-          symbol,
-          amount_cad: confidenceScore >= 60 ? posSize : 0,
-          stop_loss: stopLossPrice,
-          take_profit: takeProfitPrice,
-        },
-        institutionalReport: {
-          timestampMT: mtFormatted,
-          qseEngine: {
-            score: qseScore,
-            technicalDetails: `Analyse RSI (14) = ${rsi}, MACD Hist = ${macd.histogram}, MM50 = ${ma50} $ CAD, MM200 = ${ma200} $ CAD.`,
-            marketRegime: isBullish ? 'Tendance Haussière' : 'Range / Consolidation',
-          },
-          smiEngine: {
-            score: smiScore,
-            sentimentDetails: `Sentiment de marché ${isBullish ? 'positif' : 'neutre'} d après l agrégation de données de nouvelles et volume.`,
-            macroImpact: 'Taux directeurs et contexte macroéconomique neutres à légèrement favorables.',
-          },
-          croEngine: {
-            vetoStatus: 'APPROVED',
-            slotAssigned: 1,
-            slotCorrelationCheck: 'Corrélation acceptable avec les autres slots ouverts du portefeuille.',
-            riskPerTradePercent: maxRiskPercentPerTrade || 2,
-            riskRewardRatio: '1:2.2 (R:R Conforme >= 1:2)',
-            stopLossPriceCAD: stopLossPrice,
-            takeProfitPriceCAD: takeProfitPrice,
-            riskDetails: `Calcul d exposition au risque valide : ${maxRiskAmountCAD.toFixed(2)} $ CAD à risquer max.`,
-          },
-          cioEngine: {
-            globalConfidenceScore: confidenceScore,
-            finalDecision: confidenceScore >= 60 ? 'ACHETEUR' : 'NEUTRE',
-            decisionEnglish: confidenceScore >= 60 ? 'BUY' : 'HOLD',
-            capitalScalingRecommendation: activeBudgetCAD >= 1150 ? 'Déblocage de tranche +1000 $ CAD validé' : 'Maintenir le capital actif',
-            shouldScaleUp: activeBudgetCAD >= 1150,
-            reasoning: `Calcul CIO : (${qseScore} × 0.50) + (${smiScore} × 0.30) - (${croRiskFactor} × 0.20) = ${confidenceScore}/100`,
-          },
-          aeeEngine: {
-            orderType: 'LIMIT',
-            estimatedHorizon: 'Intraday',
-            webhookPayload: {
-              timestamp_mt: mtFormatted,
-              engine_status: 'EXECUTED',
-              confidence_score: confidenceScore,
-              slot_id: 1,
-              action: confidenceScore >= 60 ? 'BUY' : 'HOLD',
-              symbol,
-              amount_cad: confidenceScore >= 60 ? posSize : 0,
-              stop_loss: stopLossPrice,
-              take_profit: takeProfitPrice,
-            }
-          }
-        }
-      };
-
-      return res.json({ success: true, debate: fallbackDebate, mode: 'rule-engine-fallback' });
-    }
+    return res.json({ success: true, debate: parsed, mode: 'gemini', model: GEMINI_MODEL });
   } catch (err: any) {
-    console.error('Error in agent analysis:', err);
-    res.status(500).json({ error: err.message || 'Error processing agent deliberation' });
+    // Repli explicite plutôt qu'un 500 : l'utilisateur obtient une décision
+    // exploitable et sait qu'elle ne vient pas du modèle.
+    console.error('[agents/analyze] échec Gemini, repli sur le moteur de règles :', err?.message || err);
+    return res.json({
+      success: true,
+      debate: runRuleEngine(safeAsset, safePortfolio),
+      mode: 'rule-engine',
+      notice: `Appel Gemini indisponible (${err?.message || 'erreur inconnue'}) : délibération produite par le moteur de règles déterministe.`,
+    });
   }
 });
 
-// Webhook Sender / Simulator Endpoint
-app.post('/api/webhook/send', async (req, res) => {
-  const { webhookUrl, payload } = req.body;
-  
-  if (!webhookUrl || !payload) {
-    return res.status(400).json({ error: 'webhookUrl and payload required' });
+/**
+ * Analyse de sentiment sur 7 jours. En l'absence de clé, la réponse indique
+ * clairement que les scores proviennent du calcul technique local et non d'un
+ * modèle — l'interface s'appuie sur ce champ pour ne pas afficher un badge
+ * « Gemini » mensonger.
+ */
+app.post('/api/agents/sentiment', async (req, res) => {
+  const { assets } = req.body ?? {};
+
+  if (!Array.isArray(assets) || assets.length === 0) {
+    return res.status(400).json({ error: 'Le champ "assets" doit être un tableau non vide.' });
+  }
+
+  const symbols = assets
+    .filter((a: any) => a && typeof a.symbol === 'string')
+    .slice(0, 25)
+    .map((a: any) => ({
+      symbol: a.symbol,
+      rsi: isFiniteNumber(a.rsi) ? a.rsi : 50,
+      change24h: isFiniteNumber(a.change24h) ? a.change24h : 0,
+      histogram: isFiniteNumber(a.macd?.histogram) ? a.macd.histogram : 0,
+    }));
+
+  if (symbols.length === 0) {
+    return res.status(400).json({ error: 'Aucun actif exploitable dans "assets".' });
+  }
+
+  if (!aiClient) {
+    return res.json({ success: true, source: 'TECHNIQUE', scores: null });
   }
 
   try {
-    if (webhookUrl.startsWith('http')) {
-      const response = await fetch(webhookUrl, {
+    const response = await aiClient.models.generateContent({
+      model: GEMINI_MODEL,
+      contents:
+        `Évaluez le sentiment de marché sur 7 jours pour ces actifs, sur une échelle de 0 (capitulation) à 100 (euphorie). ` +
+        `Un score par actif et par jour, du plus ancien (index 0) au plus récent (index 6).\n` +
+        JSON.stringify(symbols),
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            assets: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  symbol: { type: Type.STRING },
+                  dailyScores: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+                  driver: { type: Type.STRING },
+                },
+                required: ['symbol', 'dailyScores', 'driver'],
+              },
+            },
+          },
+          required: ['assets'],
+        },
+      },
+    });
+
+    const parsed = JSON.parse(response.text || '{}');
+    if (!Array.isArray(parsed?.assets)) throw new Error('Réponse de sentiment mal formée');
+
+    return res.json({ success: true, source: 'GEMINI', scores: parsed.assets, model: GEMINI_MODEL });
+  } catch (err: any) {
+    console.error('[agents/sentiment] échec Gemini, repli technique :', err?.message || err);
+    return res.json({ success: true, source: 'TECHNIQUE', scores: null });
+  }
+});
+
+app.post('/api/webhook/send', async (req, res) => {
+  const { webhookUrl, payload } = req.body ?? {};
+
+  if (typeof webhookUrl !== 'string' || !webhookUrl || payload === undefined) {
+    return res.status(400).json({ error: '"webhookUrl" et "payload" sont requis.' });
+  }
+
+  let target: URL | null = null;
+  try {
+    target = new URL(webhookUrl);
+  } catch {
+    target = null;
+  }
+
+  // Une URL non absolue reste simulée localement : c'est le mode « bac à sable »
+  // documenté dans l'interface.
+  if (!target) {
+    return res.json({
+      status: 'SIMULATED',
+      statusCode: 200,
+      message: 'Webhook simulé localement (URL non absolue).',
+    });
+  }
+
+  if (target.protocol !== 'https:' && target.protocol !== 'http:') {
+    return res.status(400).json({ error: 'Seuls les schémas http et https sont acceptés.' });
+  }
+
+  try {
+    // Sans délai maximal, un endpoint qui ne répond pas bloquait la requête
+    // jusqu'au timeout par défaut de Node.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    let response: Response;
+    try {
+      response = await fetch(target.toString(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
-      return res.json({
-        status: response.ok ? 'SUCCESS' : 'FAILED',
-        statusCode: response.status,
-        message: `Webhook transmis avec statut HTTP ${response.status}`,
-      });
-    } else {
-      // Internal simulation
-      return res.json({
-        status: 'SIMULATED',
-        statusCode: 200,
-        message: 'Webhook simulé avec succès dans le logger interne.',
-      });
+    } finally {
+      clearTimeout(timeout);
     }
+
+    return res.json({
+      status: response.ok ? 'SUCCESS' : 'FAILED',
+      statusCode: response.status,
+      message: `Webhook transmis — réponse HTTP ${response.status}.`,
+    });
   } catch (err: any) {
-    res.json({
+    const aborted = err?.name === 'AbortError';
+    return res.json({
       status: 'FAILED',
-      statusCode: 500,
-      message: `Erreur d'envoi du webhook: ${err.message}`,
+      statusCode: aborted ? 504 : 502,
+      message: aborted
+        ? "Délai dépassé : l'endpoint n'a pas répondu en moins de 10 s."
+        : `Erreur d'envoi du webhook : ${err?.message || 'inconnue'}`,
     });
   }
 });
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    // Import dynamique : en production le bundle CJS ne doit pas charger Vite.
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    // `import.meta.url` est vidé par esbuild dans un bundle CJS, ce qui faisait
+    // planter le serveur au démarrage. `process.cwd()` est stable dans les deux
+    // formats de sortie.
+    const distPath = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
@@ -374,8 +631,12 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Ferme de Trading Multi-Agents active sur http://localhost:${PORT}`);
+    console.log(`ALPHA-DESK PRO — serveur actif sur http://localhost:${PORT}`);
+    console.log(`Moteur de délibération : ${apiKey ? `Gemini (${GEMINI_MODEL})` : 'moteur de règles (GEMINI_API_KEY absente)'}`);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Échec du démarrage du serveur :', err);
+  process.exit(1);
+});

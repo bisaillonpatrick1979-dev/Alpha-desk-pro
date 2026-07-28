@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { X, Key, Shield, Radio, Database, CheckCircle2, RefreshCw, Cpu, Server, Link as LinkIcon } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, Key, Database, CheckCircle2, Cpu, Server, Link as LinkIcon, AlertTriangle } from 'lucide-react';
 import { ApiKeySettings } from '../types';
 
 interface ApiKeysModalProps {
@@ -23,6 +23,20 @@ export const ApiKeysModal: React.FC<ApiKeysModalProps> = ({
   const [binanceKey, setBinanceKey] = useState(apiKeys.binanceApiKey || '');
   const [dataMode, setDataMode] = useState<ApiKeySettings['dataMode']>(apiKeys.dataMode || 'LIVE_SIMULATED');
   const [backtestRange, setBacktestRange] = useState<ApiKeySettings['backtestYearRange']>(apiKeys.backtestYearRange || '2023-2024');
+
+  // La modale reste montée : sans resynchronisation à l'ouverture, elle
+  // réaffiche indéfiniment les valeurs capturées au premier rendu.
+  useEffect(() => {
+    if (!isOpen) return;
+    setTwelveDataKey(apiKeys.twelveDataApiKey || '');
+    setTradingViewToken(apiKeys.tradingViewWebhookToken || '');
+    setAlpacaKey(apiKeys.alpacaApiKey || '');
+    setAlpacaSecret(apiKeys.alpacaApiSecret || '');
+    setIbkrAccount(apiKeys.interactiveBrokersAccountId || '');
+    setBinanceKey(apiKeys.binanceApiKey || '');
+    setDataMode(apiKeys.dataMode || 'LIVE_SIMULATED');
+    setBacktestRange(apiKeys.backtestYearRange || '2023-2024');
+  }, [isOpen, apiKeys]);
 
   if (!isOpen) return null;
 
@@ -249,13 +263,26 @@ export const ApiKeysModal: React.FC<ApiKeysModalProps> = ({
 
           </div>
 
-          {/* Footer Submit Buttons */}
-          <div className="pt-4 border-t border-white/10 flex items-center justify-between">
-            <div className="flex items-center space-x-2 text-[10px] text-emerald-400">
-              <Shield className="w-4 h-4" />
-              <span>Données chiffrées localement dans votre navigateur</span>
+          {/* Avertissement de stockage exact : les clés sont conservées en clair dans
+              localStorage. Annoncer un chiffrement inexistant induirait l'utilisateur
+              à saisir des identifiants de courtier réels sur cette base. */}
+          <div className="flex items-start gap-2 p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 text-[11px]">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <p>
+                Ces clés sont enregistrées <strong>en clair</strong> dans le stockage local de votre navigateur, sans
+                chiffrement. Elles ne sont jamais transmises à un serveur, mais restent lisibles par toute extension ou
+                toute personne ayant accès à cette session.
+              </p>
+              <p>
+                Cette application est une simulation : aucune de ces clés n'est utilisée pour passer un ordre réel.
+                N'y saisissez pas d'identifiants de courtier disposant de droits de négociation.
+              </p>
             </div>
+          </div>
 
+          {/* Footer Submit Buttons */}
+          <div className="pt-4 border-t border-white/10 flex items-center justify-end">
             <div className="flex items-center space-x-2">
               <button
                 type="button"

@@ -1,59 +1,43 @@
-import React, { useState } from 'react';
-import { Cpu, Play, CheckCircle2, RotateCcw, AlertTriangle, Calendar, Award, TrendingUp, BarChart2, ShieldCheck, Zap } from 'lucide-react';
-import { ApiKeySettings, MarketAsset } from '../types';
+import React, { useState, useCallback } from 'react';
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
+import { Cpu, Play, RotateCcw, Award, ShieldCheck, Zap, Info } from 'lucide-react';
+import { MarketAsset, PortfolioSettings, BacktestReport } from '../types';
+import { runBacktest, DEFAULT_BACKTEST_PARAMS, BacktestParams } from '../lib/backtest';
 
 interface BacktestTrainerProps {
-  apiKeys: ApiKeySettings;
   watchlist: MarketAsset[];
-  onApplyBacktestResults: (gainCAD: number) => void;
+  settings: PortfolioSettings;
 }
 
-export const BacktestTrainer: React.FC<BacktestTrainerProps> = ({
-  apiKeys,
-  watchlist,
-  onApplyBacktestResults,
-}) => {
-  const [selectedYear, setSelectedYear] = useState<string>('2023-2024');
-  const [isRunningSim, setIsRunningSim] = useState<boolean>(false);
-  const [simProgress, setSimProgress] = useState<number>(0);
-  const [simResults, setSimResults] = useState<{
-    totalTrades: number;
-    winRate: number;
-    maxDrawdown: number;
-    totalProfitCAD: number;
-    sharpeRatio: number;
-    bestAsset: string;
-    reasoning: string;
-  } | null>(null);
+export const BacktestTrainer: React.FC<BacktestTrainerProps> = ({ watchlist, settings }) => {
+  const [params, setParams] = useState<BacktestParams>({
+    ...DEFAULT_BACKTEST_PARAMS,
+    startingCapitalCAD: settings.totalCapitalCAD,
+  });
+  const [isRunning, setIsRunning] = useState(false);
+  const [report, setReport] = useState<BacktestReport | null>(null);
 
-  const startBacktest = () => {
-    setIsRunningSim(true);
-    setSimProgress(10);
-    setSimResults(null);
+  const startBacktest = useCallback(() => {
+    setIsRunning(true);
+    setReport(null);
 
-    const interval = setInterval(() => {
-      setSimProgress((prev) => {
-        if (prev >= 100) {
-          clearInterval(interval);
-          setIsRunningSim(false);
-          
-          // Generate realistic backtest simulation report for the selected year
-          const simulatedGain = selectedYear === '2020-2021' ? 840 : selectedYear === '2023-2024' ? 1250 : 620;
-          setSimResults({
-            totalTrades: 42,
-            winRate: 71.4,
-            maxDrawdown: -4.2,
-            totalProfitCAD: simulatedGain,
-            sharpeRatio: 2.15,
-            bestAsset: 'SHOP.TO (Shopify CAD)',
-            reasoning: `Analyse historique ${selectedYear} terminée. Le modèle multi-agents a optimisé les entrées sur Fibonacci 61.8% et les règles de gestion du risque de 2% par trade, générant +${simulatedGain} $ CAD.`,
-          });
-          return 100;
-        }
-        return prev + 22;
-      });
-    }, 400);
-  };
+    // Le calcul est synchrone mais on laisse le navigateur peindre l'état
+    // « en cours » avant de le lancer.
+    requestAnimationFrame(() => {
+      try {
+        setReport(runBacktest(watchlist, params));
+      } catch (err) {
+        console.error('Échec du backtest :', err);
+      } finally {
+        setIsRunning(false);
+      }
+    });
+  }, [watchlist, params]);
+
+  const updateParam = (key: keyof BacktestParams, value: number) =>
+    setParams((prev) => ({ ...prev, [key]: value }));
+
+  const isProfitable = (report?.totalProfitCAD ?? 0) >= 0;
 
   return (
     <div className="bg-[#0a0a0a] border border-white/10 rounded-2xl p-5 shadow-2xl space-y-5">
@@ -63,142 +47,232 @@ export const BacktestTrainer: React.FC<BacktestTrainerProps> = ({
             <Cpu className="w-5 h-5" />
           </div>
           <div>
-            <h3 className="font-bold text-white text-base tracking-tight flex items-center gap-2">
-              Entraînement du Modèle sur Données Historiques (Backtest Multi-Années)
-              <span className="px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30 text-[10px] font-mono">
-                AI Training Lab 🧪
-              </span>
+            <h3 className="font-bold text-white text-base tracking-tight">
+              Backtest de la stratégie sur l'historique des bougies
             </h3>
             <p className="text-xs text-white/50">
-              Testez et ré-entraînez vos agents Gemini sur les années passées avant d'engager le capital réel
+              La stratégie est rejouée bougie par bougie sur les {watchlist.length} actifs de la watchlist.
             </p>
           </div>
         </div>
 
-        {/* Year Range Selector */}
-        <div className="flex items-center space-x-2 bg-[#050505] p-1.5 rounded-xl border border-white/10 text-xs">
-          <Calendar className="w-4 h-4 text-purple-400 ml-1" />
-          <select
-            value={selectedYear}
-            onChange={(e) => setSelectedYear(e.target.value)}
-            className="bg-transparent text-white font-mono font-bold focus:outline-none pr-2"
-          >
-            <option value="2020-2021">2020 - 2021 (Crash Covid)</option>
-            <option value="2021-2022">2021 - 2022 (Bull Run Tech)</option>
-            <option value="2022-2023">2022 - 2023 (Correction Taux)</option>
-            <option value="2023-2024">2023 - 2024 (Boom IA)</option>
-            <option value="2024-2026">2024 - 2026 (Marchés Récents)</option>
-          </select>
+        <button
+          onClick={startBacktest}
+          disabled={isRunning}
+          className="px-6 py-2.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white font-extrabold rounded-xl text-xs flex items-center justify-center space-x-2 shadow-lg transition-all"
+        >
+          {isRunning ? (
+            <>
+              <RotateCcw className="w-4 h-4 animate-spin" />
+              <span>Simulation en cours…</span>
+            </>
+          ) : (
+            <>
+              <Play className="w-4 h-4 fill-white" />
+              <span>Lancer le backtest</span>
+            </>
+          )}
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 bg-[#050505] p-4 rounded-xl border border-white/10 text-xs font-mono">
+        <div className="space-y-1">
+          <label className="text-white/50 block text-[10px] uppercase">Capital initial ($)</label>
+          <input
+            type="number"
+            min={100}
+            value={params.startingCapitalCAD}
+            onChange={(e) => updateParam('startingCapitalCAD', Math.max(100, Number(e.target.value) || 0))}
+            className="w-full bg-[#111] border border-white/15 rounded-lg px-2 py-1.5 text-white"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-white/50 block text-[10px] uppercase">RSI d'achat (≤)</label>
+          <input
+            type="number"
+            min={5}
+            max={70}
+            value={params.rsiBuyThreshold}
+            onChange={(e) => updateParam('rsiBuyThreshold', Math.min(70, Math.max(5, Number(e.target.value) || 5)))}
+            className="w-full bg-[#111] border border-white/15 rounded-lg px-2 py-1.5 text-[#00d2ff]"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-white/50 block text-[10px] uppercase">Cible (%)</label>
+          <input
+            type="number"
+            min={0.5}
+            step="any"
+            value={params.takeProfitPercent}
+            onChange={(e) => updateParam('takeProfitPercent', Math.max(0.5, Number(e.target.value) || 0.5))}
+            className="w-full bg-[#111] border border-white/15 rounded-lg px-2 py-1.5 text-emerald-400"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-white/50 block text-[10px] uppercase">Stop (%)</label>
+          <input
+            type="number"
+            min={0.5}
+            step="any"
+            value={params.stopLossPercent}
+            onChange={(e) => updateParam('stopLossPercent', Math.max(0.5, Number(e.target.value) || 0.5))}
+            className="w-full bg-[#111] border border-white/15 rounded-lg px-2 py-1.5 text-rose-400"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-white/50 block text-[10px] uppercase">Frais A/R (%)</label>
+          <input
+            type="number"
+            min={0}
+            step="any"
+            value={params.feePercent}
+            onChange={(e) => updateParam('feePercent', Math.max(0, Number(e.target.value) || 0))}
+            className="w-full bg-[#111] border border-white/15 rounded-lg px-2 py-1.5 text-amber-400"
+          />
         </div>
       </div>
 
-      {/* Main Simulation Control Box */}
-      <div className="bg-[#050505] p-4 rounded-xl border border-white/10 space-y-4">
-        <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
-          <div className="space-y-1">
-            <h4 className="font-bold text-white text-xs uppercase tracking-wider flex items-center gap-2">
-              <Zap className="w-4 h-4 text-purple-400" />
-              Lancer la Simulation Historique des Agents
-            </h4>
-            <p className="text-xs text-white/50">
-              Simule l'exécution de 50+ transactions sur les graphiques de l'année <strong>{selectedYear}</strong>.
+      {report && (
+        <div className="bg-[#050505] p-4 rounded-xl border border-white/10 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-3">
+            <div className="flex items-center space-x-2 text-white font-bold text-xs">
+              <Award className={`w-4 h-4 ${isProfitable ? 'text-emerald-400' : 'text-rose-400'}`} />
+              <span>
+                Résultat sur {report.barsAnalysed.toLocaleString('fr-CA')} bougies et {report.assetsAnalysed} actifs
+              </span>
+            </div>
+            <span className="text-[10px] text-white/40 font-mono">{report.strategyLabel}</span>
+          </div>
+
+          {report.totalTrades === 0 ? (
+            <p className="text-xs text-white/60 py-4 text-center font-mono">
+              Aucune entrée déclenchée avec ces paramètres. Relevez le seuil RSI d'achat pour rendre la stratégie moins
+              sélective.
             </p>
-          </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 font-mono text-xs">
+                <div className="bg-[#111] p-3 rounded-xl border border-white/5">
+                  <span className="text-[10px] text-white/40 block uppercase">P&L simulé</span>
+                  <span className={`text-lg font-bold ${isProfitable ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {isProfitable ? '+' : ''}
+                    {report.totalProfitCAD.toLocaleString('fr-CA')} $
+                  </span>
+                  <span className="text-[10px] text-white/40 block">
+                    {report.returnPercent >= 0 ? '+' : ''}
+                    {report.returnPercent} %
+                  </span>
+                </div>
 
-          <button
-            onClick={startBacktest}
-            disabled={isRunningSim}
-            className="w-full sm:w-auto px-6 py-2.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white font-extrabold rounded-xl text-xs flex items-center justify-center space-x-2 shadow-lg transition-all"
-          >
-            {isRunningSim ? (
-              <>
-                <RotateCcw className="w-4 h-4 animate-spin" />
-                <span>Analyse des Bougies {simProgress}%...</span>
-              </>
-            ) : (
-              <>
-                <Play className="w-4 h-4 fill-white" />
-                <span>Démarrer le Backtest ({selectedYear})</span>
-              </>
-            )}
-          </button>
-        </div>
+                <div className="bg-[#111] p-3 rounded-xl border border-white/5">
+                  <span className="text-[10px] text-white/40 block uppercase">Transactions</span>
+                  <span className="text-lg font-bold text-white">{report.totalTrades}</span>
+                  <span className="text-[10px] text-white/40 block">{report.winningTrades} gagnantes</span>
+                </div>
 
-        {/* Progress Bar */}
-        {isRunningSim && (
-          <div className="space-y-1.5 pt-2">
-            <div className="flex justify-between text-[11px] font-mono text-purple-300">
-              <span>Simulation des micro-décisions d'agents en cours...</span>
-              <span>{simProgress}%</span>
-            </div>
-            <div className="h-2 bg-[#111] rounded-full overflow-hidden border border-white/10">
-              <div
-                className="h-full bg-gradient-to-r from-purple-500 via-[#00d2ff] to-emerald-400 transition-all duration-300"
-                style={{ width: `${simProgress}%` }}
-              />
-            </div>
-          </div>
-        )}
-      </div>
+                <div className="bg-[#111] p-3 rounded-xl border border-white/5">
+                  <span className="text-[10px] text-white/40 block uppercase">Taux de réussite</span>
+                  <span className="text-lg font-bold text-[#00d2ff]">{report.winRate} %</span>
+                </div>
 
-      {/* Simulation Results Display */}
-      {simResults && (
-        <div className="bg-[#050505] p-4 rounded-xl border border-emerald-500/30 space-y-4 animate-fade-in">
-          <div className="flex items-center justify-between border-b border-white/10 pb-3">
-            <div className="flex items-center space-x-2 text-emerald-400 font-bold text-xs">
-              <Award className="w-4 h-4" />
-              <span>Rapport de Rétro-Ingénierie du Modèle ({selectedYear})</span>
-            </div>
-            <button
-              onClick={() => onApplyBacktestResults(simResults.totalProfitCAD)}
-              className="px-3 py-1.5 bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 border border-emerald-500/40 text-xs font-bold rounded-lg transition-all"
-            >
-              Injecter les gains de test (+{simResults.totalProfitCAD} $ CAD)
-            </button>
-          </div>
+                <div className="bg-[#111] p-3 rounded-xl border border-white/5">
+                  <span className="text-[10px] text-white/40 block uppercase">Drawdown max</span>
+                  <span className="text-lg font-bold text-amber-400">−{report.maxDrawdownPercent} %</span>
+                </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono text-xs">
-            <div className="bg-[#111] p-3 rounded-xl border border-white/5">
-              <span className="text-[10px] text-white/40 block uppercase">P&L Historique</span>
-              <span className="text-lg font-bold text-emerald-400">
-                +{simResults.totalProfitCAD} $ CAD
-              </span>
-            </div>
+                <div className="bg-[#111] p-3 rounded-xl border border-white/5">
+                  <span className="text-[10px] text-white/40 block uppercase">Facteur de profit</span>
+                  <span className="text-lg font-bold text-purple-300">
+                    {Number.isFinite(report.profitFactor) ? report.profitFactor : '∞'}
+                  </span>
+                </div>
 
-            <div className="bg-[#111] p-3 rounded-xl border border-white/5">
-              <span className="text-[10px] text-white/40 block uppercase">Taux de Réussite</span>
-              <span className="text-lg font-bold text-[#00d2ff]">
-                {simResults.winRate}%
-              </span>
-            </div>
+                <div className="bg-[#111] p-3 rounded-xl border border-white/5">
+                  <span className="text-[10px] text-white/40 block uppercase">Sharpe (approx.)</span>
+                  <span className="text-lg font-bold text-white">{report.sharpeRatio}</span>
+                </div>
+              </div>
 
-            <div className="bg-[#111] p-3 rounded-xl border border-white/5">
-              <span className="text-[10px] text-white/40 block uppercase">Drawdown Max</span>
-              <span className="text-lg font-bold text-amber-400">
-                {simResults.maxDrawdown}%
-              </span>
-            </div>
+              <div className="h-48 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={report.equityCurve} margin={{ top: 10, right: 10, left: -10, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="backtestGradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={isProfitable ? '#22c55e' : '#f43f5e'} stopOpacity={0.35} />
+                        <stop offset="95%" stopColor={isProfitable ? '#22c55e' : '#f43f5e'} stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+                    <XAxis
+                      dataKey="index"
+                      stroke="rgba(255,255,255,0.3)"
+                      fontSize={10}
+                      tickLine={false}
+                      label={{ value: 'Transactions', fill: 'rgba(255,255,255,0.3)', fontSize: 10, position: 'insideBottom', offset: -2 }}
+                    />
+                    <YAxis
+                      stroke="rgba(255,255,255,0.3)"
+                      fontSize={10}
+                      tickLine={false}
+                      domain={['dataMin - 100', 'dataMax + 100']}
+                      tickFormatter={(v) => `${Number(v).toLocaleString('fr-CA')} $`}
+                      width={80}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: '#0a0a0a',
+                        borderColor: 'rgba(255,255,255,0.15)',
+                        borderRadius: '10px',
+                        fontSize: '11px',
+                      }}
+                      formatter={(value: any) => [`${Number(value).toLocaleString('fr-CA')} $ CAD`, 'Équité simulée']}
+                      labelFormatter={(label) => `Après ${label} transaction(s)`}
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey="equity"
+                      stroke={isProfitable ? '#22c55e' : '#f43f5e'}
+                      strokeWidth={2}
+                      fill="url(#backtestGradient)"
+                      isAnimationActive={false}
+                    />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
 
-            <div className="bg-[#111] p-3 rounded-xl border border-white/5">
-              <span className="text-[10px] text-white/40 block uppercase">Ratio de Sharpe</span>
-              <span className="text-lg font-bold text-purple-300">
-                {simResults.sharpeRatio}
-              </span>
-            </div>
-          </div>
-
-          <div className="p-3 bg-[#111] rounded-xl border border-white/5 text-xs text-white/80 space-y-1">
-            <div className="font-bold text-white flex items-center gap-1.5">
-              <ShieldCheck className="w-4 h-4 text-[#00d2ff]" />
-              <span>Analyse Qualitative des Agents:</span>
-            </div>
-            <p className="text-xs text-white/60 leading-relaxed">
-              {simResults.reasoning} Meilleur actif négocié: <strong className="text-amber-300">{simResults.bestAsset}</strong>.
-            </p>
-          </div>
+              <div className="p-3 bg-[#111] rounded-xl border border-white/5 text-xs text-white/70 space-y-1.5">
+                <div className="font-bold text-white flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-[#00d2ff]" />
+                  <span>Lecture des résultats</span>
+                </div>
+                <p className="leading-relaxed">
+                  Meilleur actif : <strong className="text-emerald-300">{report.bestAsset}</strong> • Moins performant :{' '}
+                  <strong className="text-rose-300">{report.worstAsset}</strong>. Les frais aller-retour de{' '}
+                  {params.feePercent} % sont déduits de chaque transaction, et le stop est réputé touché avant la cible
+                  lorsqu'une même bougie franchit les deux niveaux.
+                </p>
+              </div>
+            </>
+          )}
         </div>
       )}
 
+      {/* Les résultats ne sont pas transférables au portefeuille : créditer un gain
+          de simulation sur le capital réel rendait toutes les métriques du tableau
+          de bord fausses. */}
+      <div className="flex items-start gap-2 text-[11px] text-white/50 bg-[#050505] border border-white/10 rounded-xl p-3">
+        <Info className="w-4 h-4 text-[#00d2ff] shrink-0 mt-0.5" />
+        <p className="leading-relaxed">
+          Le backtest s'exécute sur des séries de prix générées pour la démonstration, et non sur des cotations de
+          marché historiques. Ses résultats servent à comparer des jeux de paramètres entre eux ; ils ne sont pas
+          crédités au portefeuille et ne préjugent pas de performances réelles.
+        </p>
+      </div>
+
+      <div className="flex items-center gap-1.5 text-[10px] text-white/30 font-mono">
+        <Zap className="w-3 h-3" />
+        <span>Aucune donnée n'est envoyée à un service externe : le calcul est entièrement local.</span>
+      </div>
     </div>
   );
 };
