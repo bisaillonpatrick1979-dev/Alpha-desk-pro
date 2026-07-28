@@ -39,10 +39,26 @@ produit les délibérations à partir des indicateurs techniques, et l'interface
 l'analyse ne provient pas d'un modèle de langage. Le même repli s'applique si un appel Gemini échoue
 (quota, modèle inconnu, réseau).
 
+## Déploiement sur Vercel
+
+Vercel ne lance pas `server.ts` : il construit le SPA et le sert en statique. Les routes de l'API
+sont donc exposées par une **fonction serverless** (`api/index.ts`), et `vercel.json` redirige
+`/api/*` vers elle. Sans ce montage, tous les appels d'API répondent 404 en production et l'analyse
+des agents ne peut pas aboutir.
+
+Après le premier déploiement, ajoutez `GEMINI_API_KEY` dans *Settings → Environment Variables* du
+projet Vercel pour activer les délibérations par le modèle. Sans cette variable le site reste
+fonctionnel : le moteur de règles prend le relais et un bandeau l'indique.
+
+Pour vérifier qu'un déploiement est complet, appelez `/api/health` : il doit renvoyer
+`{"status":"ok", ...}` et non une page 404.
+
 ## Architecture
 
 ```
-server.ts              Express + Vite en middleware ; endpoints /api/*
+api/index.ts           Fonction serverless Vercel exposant l'API
+server/api.ts          Routes /api/* (partagées entre le serveur local et Vercel)
+server.ts              Serveur local : API + Vite en middleware ou fichiers statiques
 src/lib/
   portfolio.ts         Comptabilité du capital, P&L directionnel, sorties stop/cible
   indicators.ts        RSI (Wilder), MACD, SMA, EMA — calculés sur les bougies
